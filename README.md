@@ -154,7 +154,7 @@ are always correct — but, exactly like a real un-vacuumed Postgres table,
 the heap file and index accumulate dead entries over time. This is a
 genuine, explainable trade-off to bring up in an interview, not a bug.
 
-## What's deliberately NOT implemented (and why that's OK to say out loud)
+## What's deliberately NOT implemented
 
 - **No concurrency.** Transactions give you atomicity (all-or-nothing) but
   not isolation between simultaneous transactions, because there's only
