@@ -3,22 +3,29 @@ parser.py — Recursive descent parser for MiniSQL.
 
 Grammar supported (informal EBNF):
 
-    statement    := create_table | create_index | insert | select | explain
+    statement    := create_table | create_index | insert | update | delete
+                  | select | explain | transaction
     create_table := CREATE TABLE ident '(' coldef (',' coldef)* ')'
     coldef       := ident type [PRIMARY KEY]
     create_index := CREATE INDEX ident ON ident '(' ident ')'
     insert       := INSERT INTO ident ['(' ident (',' ident)* ')'] VALUES '(' literal (',' literal)* ')'
-    select       := SELECT collist FROM ident [join] [where] [order_by] [limit]
-    collist      := '*' | ident (',' ident)*
+    update       := UPDATE ident SET ident '=' literal (',' ident '=' literal)* [where]
+    delete       := DELETE FROM ident [where]
+    select       := SELECT collist FROM ident [join] [where] [group_by] [order_by] [limit]
+    collist      := '*' | select_item (',' select_item)*
+    select_item  := agg_func '(' ('*' | ident) ')' | ident ['.' ident]
+    agg_func     := COUNT | SUM | AVG | MIN | MAX
     join         := [INNER] JOIN ident ON ident '.' ident '=' ident '.' ident
     where        := WHERE or_expr
     or_expr      := and_expr (OR and_expr)*
     and_expr     := comparison (AND comparison)*
     comparison   := operand ('=' | '!=' | '<' | '<=' | '>' | '>=') operand
     operand      := ident ['.' ident] | NUMBER | STRING
+    group_by     := GROUP BY ident
     order_by     := ORDER BY ident [ASC | DESC]
     limit        := LIMIT NUMBER
     explain      := EXPLAIN select
+    transaction  := BEGIN [TRANSACTION] | COMMIT | ROLLBACK
 
 Each parse_X method consumes exactly the tokens for X and leaves the cursor
 positioned right after it, which is the standard recursive-descent contract.
