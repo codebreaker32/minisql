@@ -78,6 +78,19 @@ Alice
 | `tests/test_correctness.py` | Full-engine correctness, cross-checked against real SQLite. |
 | `tests/test_transactions_and_aggregates.py` | BEGIN/COMMIT/ROLLBACK semantics; COUNT/SUM/AVG/MIN/MAX/GROUP BY, cross-checked against SQLite. |
 
+## Development
+
+Code style is enforced with [black](https://github.com/psf/black) (formatting) and
+[ruff](https://github.com/astral-sh/ruff) (linting + import sorting). Config lives in
+`pyproject.toml`.
+
+```bash
+pip install -r requirements-dev.txt
+
+black .
+ruff check .
+```
+
 ## What's implemented
 
 - DDL: `CREATE TABLE`, `CREATE INDEX`
