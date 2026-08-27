@@ -1,50 +1,30 @@
 """
-journal.py — Page-image rollback journal.
+journal.py — On-disk undo journal (the "rollback journal").
 
-Before the engine lets a heap page be modified for the first time in a
-transaction, the page's original bytes ("pre-image") are appended here; a
-page that is brand new is recorded as such. To roll back — whether for an
-explicit ROLLBACK, or during startup recovery after a crash — the engine
-copies every pre-image back over its page and truncates the file below
-the lowest new page. This is exactly SQLite's rollback-journal design.
+Every heap mutation the engine performs is preceded by one line in this
+file describing how to undo it:
 
-Why page images rather than "undo this rowid": inserting into a half-full
-page rewrites the whole page, so a crash mid-write can corrupt rows that
-were committed long ago. Only a copy of the page's earlier bytes can repair
-that. (Postgres solves the same problem with full-page writes in its WAL.)
+    insert <table> <rowid>     -> undo by tombstoning (live) / truncating (recovery)
+    delete <table> <rowid>     -> undo by flipping the marker back to live
 
-Entry format (binary, big-endian):
+This is write-ahead in the classical sense: the undo record reaches the
+journal (and, in durable mode, the disk via fsync) *before* the heap file is
+touched. That ordering is the whole trick — if the process dies at any
+point, the journal on disk describes exactly the set of heap changes that
+may have happened but were never committed, and startup recovery undoes
+them in reverse order.
 
-    u8  kind          1 = PRE_IMAGE, 2 = NEW_PAGE
-    u16 table length, table name bytes
-    u64 page number
-    u32 image length, image bytes     (0 bytes for NEW_PAGE)
-    u32 CRC-32 of everything above
+The journal is cleared at the commit point: after COMMIT, or after every
+autocommit statement. Clearing it is what makes a change durable, so the
+engine fsyncs the heap files *before* clearing (otherwise a crash between
+the two could lose a committed write with no record left to recover from).
 
-The CRC lets recovery ignore a torn final entry: because the engine never
-touches a page until its journal entry is fully written (and fsync'd in
-durable mode), a torn entry can only describe a modification that never
-started. Parsing stops at the first entry that fails its CRC (SQLite's
-rule too); the engine then clears the journal whenever the file holds any
-bytes at all, so a torn first entry can't linger and hide the entries of a
-later transaction from recovery.
-
-Write-ahead ordering, the whole point: the entry reaches the journal — and
-the disk, in durable mode — *before* the page changes. Clearing the journal
-is the commit point, and the engine fsyncs the heap files first.
+SQLite's rollback-journal mode works the same way, one level of abstraction
+down (it journals whole pages rather than rows).
 """
 
 from __future__ import annotations
 import os
-import struct
-import zlib
-
-PRE_IMAGE = 1
-NEW_PAGE = 2
-
-_HDR = struct.Struct(">BH")      # kind, table length
-_PAGE = struct.Struct(">QI")     # page number, image length
-_CRC = struct.Struct(">I")
 
 
 class UndoJournal:
@@ -57,57 +37,29 @@ class UndoJournal:
         if not self._f.closed:
             self._f.close()
 
-    def size(self) -> int:
-        """Bytes in the file — non-zero even when no entry parses (torn head)."""
+    def append(self, action: str, table: str, rowid: int) -> None:
         self._f.seek(0, os.SEEK_END)
-        return self._f.tell()
-
-    @staticmethod
-    def _encode(kind: int, table: str, page_no: int, image: bytes | None) -> bytes:
-        name = table.encode()
-        image = image or b""
-        body = _HDR.pack(kind, len(name)) + name + _PAGE.pack(page_no, len(image)) + image
-        return body + _CRC.pack(zlib.crc32(body) & 0xFFFFFFFF)
-
-    def append(self, kind: int, table: str, page_no: int, image: bytes | None) -> None:
-        self._f.seek(0, os.SEEK_END)
-        self._f.write(self._encode(kind, table, page_no, image))
+        self._f.write(f"{action} {table} {rowid}\n".encode())
         self._f.flush()
         if self.sync:
             os.fsync(self._f.fileno())
 
-    def entries(self) -> list[tuple[int, str, int, bytes | None]]:
-        """Parse the journal; stops at the first short or corrupt entry."""
+    def entries(self) -> list[tuple[str, str, int]]:
         self._f.seek(0)
-        data = self._f.read()
         out = []
-        pos = 0
-        while pos < len(data):
-            try:
-                kind, name_len = _HDR.unpack_from(data, pos)
-                p = pos + _HDR.size
-                name = data[p:p + name_len].decode()
-                p += name_len
-                page_no, img_len = _PAGE.unpack_from(data, p)
-                p += _PAGE.size
-                image = data[p:p + img_len]
-                p += img_len
-                (crc,) = _CRC.unpack_from(data, p)
-                p += _CRC.size
-            except (struct.error, UnicodeDecodeError):
-                break
-            if len(image) != img_len or zlib.crc32(data[pos:p - _CRC.size]) & 0xFFFFFFFF != crc:
-                break
-            out.append((kind, name, page_no, bytes(image) if kind == PRE_IMAGE else None))
-            pos = p
+        for line in self._f.read().decode().splitlines():
+            parts = line.split()
+            if len(parts) == 3:       # ignore a torn trailing line
+                out.append((parts[0], parts[1], int(parts[2])))
         return out
 
-    def rewrite(self, entries) -> None:
-        """Replace the journal contents wholesale."""
+    def rewrite(self, entries: list[tuple[str, str, int]]) -> None:
+        """Replace the journal contents (used to drop the entries of a single
+        rolled-back statement while an enclosing transaction stays open)."""
         self._f.seek(0)
         self._f.truncate(0)
-        for kind, table, page_no, image in entries:
-            self._f.write(self._encode(kind, table, page_no, image))
+        for action, table, rowid in entries:
+            self._f.write(f"{action} {table} {rowid}\n".encode())
         self._f.flush()
         if self.sync:
             os.fsync(self._f.fileno())

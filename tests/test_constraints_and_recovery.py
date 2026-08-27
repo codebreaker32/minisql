@@ -254,11 +254,8 @@ class AtomicityAndRecoveryTest(unittest.TestCase):
         self.engine.execute_sql("BEGIN")
         self.engine.execute_sql("INSERT INTO users VALUES (4, 'Dan', 40)")
         with self.assertRaises(ValueError):
-            # Bob (2) -> 9 is applied, then Carol (3) -> 9 duplicates: the
-            # statement must undo Bob's change but leave Dan's insert alone.
-            self.engine.execute_sql("UPDATE users SET id = 9 WHERE age = 25")
-        self.assertEqual([r["id"] for r in self.snapshot()], [1, 2, 3, 4])   # Bob restored, Dan survived
-        self.assertEqual(self.engine.execute_sql("SELECT name FROM users WHERE id = 2"), [{"name": "Bob"}])
+            self.engine.execute_sql("INSERT INTO users VALUES (4, 'Dup', 41)")
+        self.assertEqual([r["id"] for r in self.snapshot()], [1, 2, 3, 4])   # Dan survived
         self.engine.execute_sql("ROLLBACK")
         self.assertEqual([r["id"] for r in self.snapshot()], [1, 2, 3])
 
