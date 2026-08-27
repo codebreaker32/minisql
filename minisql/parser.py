@@ -3,22 +3,32 @@ parser.py — Recursive descent parser for MiniSQL.
 
 Grammar supported (informal EBNF):
 
-    statement    := create_table | create_index | insert | select | explain
+    statement    := create_table | create_index | insert | update | delete
+                  | select | explain | BEGIN [TRANSACTION] | COMMIT | ROLLBACK
     create_table := CREATE TABLE ident '(' coldef (',' coldef)* ')'
     coldef       := ident type [PRIMARY KEY]
     create_index := CREATE INDEX ident ON ident '(' ident ')'
     insert       := INSERT INTO ident ['(' ident (',' ident)* ')'] VALUES '(' literal (',' literal)* ')'
-    select       := SELECT collist FROM ident [join] [where] [order_by] [limit]
-    collist      := '*' | ident (',' ident)*
-    join         := [INNER] JOIN ident ON ident '.' ident '=' ident '.' ident
+    update       := UPDATE ident SET ident '=' literal (',' ident '=' literal)* [where]
+    delete       := DELETE FROM ident [where]
+    select       := SELECT collist FROM ident [join] [where] [group_by] [order_by] [limit]
+    collist      := '*' | select_item (',' select_item)*
+    select_item  := agg '(' ('*' | ident) ')' | ident ['.' ident]
+    join         := [INNER] JOIN ident ON column_ref '=' column_ref
     where        := WHERE or_expr
     or_expr      := and_expr (OR and_expr)*
     and_expr     := comparison (AND comparison)*
     comparison   := operand ('=' | '!=' | '<' | '<=' | '>' | '>=') operand
-    operand      := ident ['.' ident] | NUMBER | STRING
-    order_by     := ORDER BY ident [ASC | DESC]
+                  | operand IS [NOT] NULL
+    operand      := column_ref | NUMBER | STRING | TRUE | FALSE | NULL
+    group_by     := GROUP BY ident
+    order_by     := ORDER BY select_item [ASC | DESC]
     limit        := LIMIT NUMBER
     explain      := EXPLAIN select
+
+An `ident` is an IDENT token, a "double-quoted identifier", or one of the
+NON_RESERVED keywords (type names, aggregate names, KEY, INDEX, ...), so a
+column can be called `key`, `count` or `text` without quoting.
 
 Each parse_X method consumes exactly the tokens for X and leaves the cursor
 positioned right after it, which is the standard recursive-descent contract.
@@ -32,6 +42,13 @@ from .ast_nodes import (
     UpdateStmt, DeleteStmt, TransactionStmt, AggExpr,
 )
 
+COLUMN_TYPES = {"INT", "INTEGER", "TEXT", "VARCHAR", "REAL", "FLOAT"}
+AGG_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
+
+# Keywords that may also be used as plain identifiers (column/table/index
+# names) because their position in the grammar is never ambiguous.
+NON_RESERVED = COLUMN_TYPES | AGG_FUNCS | {"KEY", "INDEX", "TRANSACTION"}
+
 
 class ParseError(Exception):
     pass
@@ -44,8 +61,9 @@ class Parser:
 
     # ---- token stream helpers ----
 
-    def peek(self) -> Token:
-        return self.tokens[self.i]
+    def peek(self, offset: int = 0) -> Token:
+        j = min(self.i + offset, len(self.tokens) - 1)
+        return self.tokens[j]
 
     def advance(self) -> Token:
         tok = self.tokens[self.i]
@@ -55,6 +73,10 @@ class Parser:
     def check_kw(self, kw: str) -> bool:
         t = self.peek()
         return t.type == TokType.KEYWORD and t.value == kw
+
+    def check_punct(self, p: str) -> bool:
+        t = self.peek()
+        return t.type == TokType.PUNCT and t.value == p
 
     def expect_kw(self, kw: str) -> Token:
         if not self.check_kw(kw):
@@ -67,9 +89,8 @@ class Parser:
         return self.advance()
 
     def expect_punct(self, p: str) -> Token:
-        t = self.peek()
-        if t.type != TokType.PUNCT or t.value != p:
-            raise ParseError(f"Expected {p!r}, got {t!r}")
+        if not self.check_punct(p):
+            raise ParseError(f"Expected {p!r}, got {self.peek()!r}")
         return self.advance()
 
     def expect_op(self, op: str) -> Token:
@@ -77,6 +98,20 @@ class Parser:
         if t.type != TokType.OP or t.value != op:
             raise ParseError(f"Expected operator {op!r}, got {t!r}")
         return self.advance()
+
+    @staticmethod
+    def is_ident(t: Token) -> bool:
+        return t.type == TokType.IDENT or (
+            t.type == TokType.KEYWORD and t.value in NON_RESERVED
+        )
+
+    def expect_ident(self) -> str:
+        t = self.peek()
+        if not self.is_ident(t):
+            raise ParseError(f"Expected identifier, got {t!r}")
+        self.advance()
+        # a non-reserved keyword used as a name keeps the case the user typed
+        return t.text if t.type == TokType.KEYWORD else t.value
 
     # ---- entry point ----
 
@@ -120,21 +155,19 @@ class Parser:
 
     def parse_create_table(self):
         self.expect_kw("TABLE")
-        name = self.expect_type(TokType.IDENT).value
+        name = self.expect_ident()
         self.expect_punct("(")
         cols = [self.parse_column_def()]
-        while self.peek().type == TokType.PUNCT and self.peek().value == ",":
+        while self.check_punct(","):
             self.advance()
             cols.append(self.parse_column_def())
         self.expect_punct(")")
         return CreateTableStmt(name, cols)
 
     def parse_column_def(self) -> ColumnDef:
-        name = self.expect_type(TokType.IDENT).value
+        name = self.expect_ident()
         type_tok = self.advance()
-        if type_tok.type != TokType.KEYWORD or type_tok.value not in (
-            "INT", "INTEGER", "TEXT", "VARCHAR", "REAL", "FLOAT",
-        ):
+        if type_tok.type != TokType.KEYWORD or type_tok.value not in COLUMN_TYPES:
             raise ParseError(f"Expected a column type, got {type_tok!r}")
         pk = False
         if self.check_kw("PRIMARY"):
@@ -145,11 +178,11 @@ class Parser:
 
     def parse_create_index(self):
         self.expect_kw("INDEX")
-        idx_name = self.expect_type(TokType.IDENT).value
+        idx_name = self.expect_ident()
         self.expect_kw("ON")
-        table_name = self.expect_type(TokType.IDENT).value
+        table_name = self.expect_ident()
         self.expect_punct("(")
-        col = self.expect_type(TokType.IDENT).value
+        col = self.expect_ident()
         self.expect_punct(")")
         return CreateIndexStmt(idx_name, table_name, col)
 
@@ -158,19 +191,19 @@ class Parser:
     def parse_insert(self):
         self.expect_kw("INSERT")
         self.expect_kw("INTO")
-        table = self.expect_type(TokType.IDENT).value
+        table = self.expect_ident()
         columns = None
-        if self.peek().type == TokType.PUNCT and self.peek().value == "(":
+        if self.check_punct("("):
             self.advance()
-            columns = [self.expect_type(TokType.IDENT).value]
-            while self.peek().value == ",":
+            columns = [self.expect_ident()]
+            while self.check_punct(","):
                 self.advance()
-                columns.append(self.expect_type(TokType.IDENT).value)
+                columns.append(self.expect_ident())
             self.expect_punct(")")
         self.expect_kw("VALUES")
         self.expect_punct("(")
         values = [self.parse_literal_value()]
-        while self.peek().value == ",":
+        while self.check_punct(","):
             self.advance()
             values.append(self.parse_literal_value())
         self.expect_punct(")")
@@ -194,15 +227,15 @@ class Parser:
 
     def parse_update(self):
         self.expect_kw("UPDATE")
-        table = self.expect_type(TokType.IDENT).value
+        table = self.expect_ident()
         self.expect_kw("SET")
         assignments = {}
-        col = self.expect_type(TokType.IDENT).value
+        col = self.expect_ident()
         self.expect_op("=")
         assignments[col] = self.parse_literal_value()
-        while self.peek().type == TokType.PUNCT and self.peek().value == ",":
+        while self.check_punct(","):
             self.advance()
-            col = self.expect_type(TokType.IDENT).value
+            col = self.expect_ident()
             self.expect_op("=")
             assignments[col] = self.parse_literal_value()
         where = None
@@ -216,7 +249,7 @@ class Parser:
     def parse_delete(self):
         self.expect_kw("DELETE")
         self.expect_kw("FROM")
-        table = self.expect_type(TokType.IDENT).value
+        table = self.expect_ident()
         where = None
         if self.check_kw("WHERE"):
             self.advance()
@@ -229,7 +262,7 @@ class Parser:
         self.expect_kw("SELECT")
         columns = self.parse_column_list()
         self.expect_kw("FROM")
-        table = self.expect_type(TokType.IDENT).value
+        table = self.expect_ident()
 
         join = None
         if self.check_kw("JOIN") or self.check_kw("INNER"):
@@ -244,14 +277,14 @@ class Parser:
         if self.check_kw("GROUP"):
             self.advance()
             self.expect_kw("BY")
-            group_by = self.expect_type(TokType.IDENT).value
+            group_by = self.parse_qualified_ident()
 
         order_by = None
         order_desc = False
         if self.check_kw("ORDER"):
             self.advance()
             self.expect_kw("BY")
-            order_by = self.expect_type(TokType.IDENT).value
+            order_by = self.parse_select_item()   # a column, or e.g. COUNT(*)
             if self.check_kw("DESC"):
                 self.advance()
                 order_desc = True
@@ -266,37 +299,40 @@ class Parser:
         return SelectStmt(columns, table, join, where, group_by, order_by, order_desc, limit)
 
     def parse_column_list(self) -> list:
-        if self.peek().type == TokType.PUNCT and self.peek().value == "*":
+        if self.check_punct("*"):
             self.advance()
             return ["*"]
         cols = [self.parse_select_item()]
-        while self.peek().type == TokType.PUNCT and self.peek().value == ",":
+        while self.check_punct(","):
             self.advance()
             cols.append(self.parse_select_item())
         return cols
 
     def parse_select_item(self):
         t = self.peek()
-        if t.type == TokType.KEYWORD and t.value in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
+        # An aggregate is `FUNC (`; a bare `count` not followed by '(' is just
+        # a column that happens to be called count.
+        if (t.type == TokType.KEYWORD and t.value in AGG_FUNCS
+                and self.peek(1).type == TokType.PUNCT and self.peek(1).value == "("):
             func = t.value
             self.advance()
             self.expect_punct("(")
-            if self.peek().type == TokType.PUNCT and self.peek().value == "*":
+            if self.check_punct("*"):
                 if func != "COUNT":
                     raise ParseError(f"{func}(*) is not valid — only COUNT(*) is allowed")
                 self.advance()
                 arg = "*"
             else:
-                arg = self.expect_type(TokType.IDENT).value
+                arg = self.parse_qualified_ident()
             self.expect_punct(")")
             return AggExpr(func, arg)
         return self.parse_qualified_ident()
 
     def parse_qualified_ident(self) -> str:
-        name = self.expect_type(TokType.IDENT).value
-        if self.peek().type == TokType.PUNCT and self.peek().value == ".":
+        name = self.expect_ident()
+        if self.check_punct("."):
             self.advance()
-            name2 = self.expect_type(TokType.IDENT).value
+            name2 = self.expect_ident()
             return f"{name}.{name2}"
         return name
 
@@ -304,18 +340,18 @@ class Parser:
         if self.check_kw("INNER"):
             self.advance()
         self.expect_kw("JOIN")
-        table = self.expect_type(TokType.IDENT).value
+        table = self.expect_ident()
         self.expect_kw("ON")
         left = self.parse_column_ref()
-        self.expect_type(TokType.OP)  # '=' — join conditions are always equality here
+        self.expect_op("=")   # only equi-joins are supported; anything else is an error
         right = self.parse_column_ref()
         return JoinClause(table, left, right)
 
     def parse_column_ref(self) -> ColumnRef:
-        name = self.expect_type(TokType.IDENT).value
-        if self.peek().type == TokType.PUNCT and self.peek().value == ".":
+        name = self.expect_ident()
+        if self.check_punct("."):
             self.advance()
-            col = self.expect_type(TokType.IDENT).value
+            col = self.expect_ident()
             return ColumnRef(col, table=name)
         return ColumnRef(name)
 
@@ -339,6 +375,14 @@ class Parser:
 
     def parse_comparison(self) -> BinOp:
         left = self.parse_operand()
+        if self.check_kw("IS"):
+            self.advance()
+            op = "IS"
+            if self.check_kw("NOT"):
+                self.advance()
+                op = "IS NOT"
+            self.expect_kw("NULL")
+            return BinOp(left, op, Literal(None))
         op_tok = self.expect_type(TokType.OP)
         op = "!=" if op_tok.value == "<>" else op_tok.value
         right = self.parse_operand()
@@ -346,11 +390,11 @@ class Parser:
 
     def parse_operand(self) -> Expr:
         t = self.peek()
-        if t.type == TokType.IDENT:
+        if t.type == TokType.KEYWORD and t.value in ("TRUE", "FALSE", "NULL"):
+            return Literal(self.parse_literal_value())
+        if self.is_ident(t):
             return self.parse_column_ref()
-        if t.type in (TokType.NUMBER, TokType.STRING) or (
-            t.type == TokType.KEYWORD and t.value in ("TRUE", "FALSE", "NULL")
-        ):
+        if t.type in (TokType.NUMBER, TokType.STRING):
             return Literal(self.parse_literal_value())
         raise ParseError(f"Expected column or literal, got {t!r}")
 
@@ -360,7 +404,7 @@ def parse(sql: str):
     parser = Parser(tokens)
     stmt = parser.parse_statement()
     # allow an optional trailing semicolon
-    if parser.peek().type == TokType.PUNCT and parser.peek().value == ";":
+    if parser.check_punct(";"):
         parser.advance()
     if parser.peek().type != TokType.EOF:
         raise ParseError(f"Unexpected trailing tokens starting at {parser.peek()!r}")

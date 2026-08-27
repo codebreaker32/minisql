@@ -5,26 +5,32 @@ Every node type is executed by a generator function: each operator pulls
 rows from its child generator(s) one at a time and yields transformed rows
 upward, rather than materializing intermediate results in bulk. This is
 the same "pull-based, one-tuple-at-a-time" model Postgres's executor uses
-(the classic 1994 Volcano paper). SortNode is the one necessary exception —
-sorting fundamentally requires seeing every input row before it can produce
-its first output row, which is true in real engines too (they spill to disk
-for large sorts; MiniSQL just holds it in memory).
+(the classic 1994 Volcano paper). SortNode and AggregateNode are the two
+necessary exceptions — sorting or aggregating fundamentally requires seeing
+every input row before producing the first output row, which is true in
+real engines too (they spill to disk for large sorts; MiniSQL just holds it
+in memory).
 
 Row representation: every row flowing through the executor is a plain dict
 containing BOTH a bare key per column ("age") AND a table-qualified key
 ("users.age"). This lets Filter/Sort/Project resolve a column reference
 regardless of whether the query wrote it qualified or not, and lets a join
-combine two tables' rows without silently losing one side's column when
-names collide (documented limitation: an unqualified name shared by both
-tables in a join resolves to the right-hand table's value, since it is
-merged in last — queries against ambiguous columns should qualify them).
+combine two tables' rows without losing either side's column when names
+collide: the qualified keys are always distinct, and the planner rejects an
+*unqualified* reference to a column that exists in both joined tables as
+ambiguous, so the bare-key collision is never observable.
+
+NULL semantics follow SQL: any comparison involving NULL is false (so
+`WHERE age > 25` and `WHERE age = NULL` both exclude NULL rows), `IS NULL` /
+`IS NOT NULL` are the only way to test for it, aggregates other than
+COUNT(*) skip NULLs, and ORDER BY sorts NULLs first (as SQLite does).
 """
 
 from __future__ import annotations
 from collections import defaultdict
 from .planner import (
     SeqScanNode, IndexScanNode, NestedLoopJoinNode, FilterNode,
-    SortNode, ProjectNode, AggregateNode, LimitNode,
+    SortNode, ProjectNode, AggregateNode, LimitNode, output_name,
 )
 from .ast_nodes import BinOp, ColumnRef, Literal, AggExpr
 
@@ -34,6 +40,29 @@ def _qualify(table: str, row: dict) -> dict:
     for k, v in row.items():
         out[f"{table}.{k}"] = v
     return out
+
+
+def _sort_key(key: str):
+    # (is_not_null, value): NULLs sort first in ASC, last in DESC, and never
+    # get compared against a real value (which would raise TypeError).
+    def k(row):
+        v = row.get(key)
+        return (v is not None, v)
+    return k
+
+
+def index_lookup(index, op: str, value):
+    """Rowids from a B-tree for `column OP value`. Shared by the SELECT
+    executor and the UPDATE/DELETE row matcher so both use identical logic."""
+    if value is None:
+        return iter(())          # nothing compares equal/less/greater to NULL
+    if op == "=":
+        return iter(index.search(value))
+    if op in (">", ">="):
+        return index.range_search(low=value, low_inclusive=(op == ">="))
+    if op in ("<", "<="):
+        return index.range_search(high=value, high_inclusive=(op == "<="))
+    raise ValueError(f"Unsupported index op {op!r}")
 
 
 def execute(plan, engine) -> "Iterator[dict]":
@@ -46,36 +75,25 @@ def execute(plan, engine) -> "Iterator[dict]":
     if isinstance(plan, IndexScanNode):
         heap = engine.get_heap(plan.table)
         index = engine.get_index(plan.table, plan.column)
-        if plan.op == "=":
-            rowids = index.search(plan.value)
-        elif plan.op in (">", ">="):
-            rowids = index.range_search(low=plan.value, low_inclusive=(plan.op == ">="))
-        elif plan.op in ("<", "<="):
-            rowids = index.range_search(high=plan.value, high_inclusive=(plan.op == "<="))
-        elif plan.op == "!=":
-            rowids = (rid for k, rid in index.inorder() if k != plan.value)
-        else:
-            raise ValueError(f"Unsupported index op {plan.op!r}")
-        for rowid in rowids:
+        for rowid in index_lookup(index, plan.op, plan.value):
             row = heap.read(rowid)
-            if row is not None:
+            if row is not None:      # skip stale entries for tombstoned rows
                 yield _qualify(plan.table, row)
         return
 
     if isinstance(plan, NestedLoopJoinNode):
-        # Classic nested-loop join: materialize the (smaller, ideally)
-        # right side once, then stream the left side against it. O(n*m)
-        # time — MiniSQL does not implement hash join or merge join, which
-        # is the main thing a production optimizer would pick instead when
-        # there's no index to support an index-nested-loop join.
+        # Classic nested-loop join: materialize the right side once, then
+        # stream the left side against it. O(n*m) time — MiniSQL does not
+        # implement hash join or merge join, which is the main thing a
+        # production optimizer would pick instead.
         right_rows = list(execute(plan.right, engine))
         for left_row in execute(plan.left, engine):
             lval = left_row.get(plan.left_key)
+            if lval is None:
+                continue             # NULL never joins
             for right_row in right_rows:
-                rval = right_row.get(plan.right_key)
-                if lval == rval:
-                    merged = {**right_row, **left_row}
-                    yield merged
+                if lval == right_row.get(plan.right_key):
+                    yield {**right_row, **left_row}
         return
 
     if isinstance(plan, FilterNode):
@@ -86,7 +104,7 @@ def execute(plan, engine) -> "Iterator[dict]":
 
     if isinstance(plan, SortNode):
         rows = list(execute(plan.child, engine))
-        rows.sort(key=lambda r: r.get(plan.key), reverse=plan.desc)
+        rows.sort(key=_sort_key(plan.key), reverse=plan.desc)
         yield from rows
         return
 
@@ -120,21 +138,16 @@ def execute(plan, engine) -> "Iterator[dict]":
     raise ValueError(f"Unknown plan node: {plan!r}")
 
 
-def _agg_display_name(agg: AggExpr) -> str:
-    return f"{agg.func}({agg.arg})"
-
-
 def _compute_agg_row(rows: list[dict], columns: list, group_col=None, group_value=None) -> dict:
     """Compute one output row of aggregate results over `rows` (all the rows
     in a single group, or all matching rows if there's no GROUP BY). This is
-    the one "blocking" step in an otherwise all-generator executor: you
-    cannot know COUNT/SUM/AVG/MIN/MAX until every row in the group has been
-    seen, so — like Sort — it must materialize its input first."""
+    a "blocking" step: you cannot know COUNT/SUM/AVG/MIN/MAX until every row
+    in the group has been seen, so — like Sort — it materializes its input."""
     out = {}
     for col in columns:
         if isinstance(col, AggExpr):
             values = [r.get(col.arg) for r in rows if col.arg == "*" or r.get(col.arg) is not None]
-            name = _agg_display_name(col)
+            name = output_name(col)
             if col.func == "COUNT":
                 out[name] = len(rows) if col.arg == "*" else len(values)
             elif col.func == "SUM":
@@ -165,17 +178,24 @@ def _eval(expr, row: dict):
             return bool(_eval(expr.left, row)) and bool(_eval(expr.right, row))
         if expr.op == "OR":
             return bool(_eval(expr.left, row)) or bool(_eval(expr.right, row))
-        lval, rval = _eval(expr.left, row), _eval(expr.right, row)
+        lval = _eval(expr.left, row)
+        if expr.op == "IS":
+            return lval is None
+        if expr.op == "IS NOT":
+            return lval is not None
+        rval = _eval(expr.right, row)
+        if lval is None or rval is None:
+            return False             # SQL: any comparison with NULL is not true
         if expr.op == "=":
             return lval == rval
         if expr.op == "!=":
             return lval != rval
         if expr.op == "<":
-            return lval is not None and rval is not None and lval < rval
+            return lval < rval
         if expr.op == "<=":
-            return lval is not None and rval is not None and lval <= rval
+            return lval <= rval
         if expr.op == ">":
-            return lval is not None and rval is not None and lval > rval
+            return lval > rval
         if expr.op == ">=":
-            return lval is not None and rval is not None and lval >= rval
+            return lval >= rval
     raise ValueError(f"Cannot evaluate expression: {expr!r}")
