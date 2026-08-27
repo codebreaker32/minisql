@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same branch cancels the run already in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The engine has no runtime dependencies; the test suite uses only the
+      # standard library (sqlite3 is the ground-truth oracle).
+      - name: Run test suite
+        run: python -m unittest discover tests -v
+
+      # End-to-end check that the CLI still works: pipe a short session
+      # through the REPL and assert on its output.
+      - name: REPL smoke test
+        run: |
+          printf '%s\n' \
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);" \
+            "INSERT INTO users VALUES (1, 'Alice', 30);" \
+            "CREATE INDEX idx_age ON users (age);" \
+            "EXPLAIN SELECT name FROM users WHERE age > 25;" \
+            "SELECT name FROM users WHERE age > 25;" \
+            "exit" | python repl.py ci_smoke_data | tee repl.log
+          grep -q "IndexScan(table=users, age > 25)" repl.log
+          grep -q "Alice" repl.log
+
+  lint:
+    name: Lint (ruff + black)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The formatters were configured in #6 but the codebase hasn't been
+    # formatted yet, so the two lint steps report (as warning annotations)
+    # without failing the job. Tracked in #9: once the formatting-only PR
+    # lands, delete the two `continue-on-error` lines below to make lint
+    # a required check.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install ruff and black
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff
+        continue-on-error: true
+        run: ruff check --output-format=github .
+
+      - name: black
+        continue-on-error: true
+        run: black --check --diff .
