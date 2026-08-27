@@ -331,6 +331,47 @@ class PageJournalRecoveryTest(unittest.TestCase):
         self.engine = Engine(data_dir=TEST_DATA_DIR)
         self.assertEqual(self.ids(), list(range(120)))              # recovered — row 3 is back
 
+    def _fail_next_journal_write_after(self, nbytes):
+        """Make the next os.write on the journal land only `nbytes` bytes and
+        then raise ENOSPC, as a full disk would."""
+        import minisql.storage.journal as jmod
+        real_write = os.write
+        state = {"armed": True}
+
+        def flaky(fd, data):
+            if state["armed"] and fd == self.engine._journal._fd:
+                state["armed"] = False
+                real_write(fd, bytes(data[:nbytes]))
+                raise OSError(28, "No space left on device")
+            return real_write(fd, data)
+
+        patcher = unittest.mock.patch.object(jmod.os, "write", flaky)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_failed_journal_append_repairs_journal_and_aborts_transaction(self):
+        before = self.ids()
+        self.engine.execute_sql("BEGIN")
+        self.engine.execute_sql("DELETE FROM t WHERE id = 3")           # journals page 1, modifies it
+        jsize = self.engine._journal.size()
+        self._fail_next_journal_write_after(20)                      # next entry is torn mid-write
+        with self.assertRaises(OSError):
+            self.engine.execute_sql("INSERT INTO t VALUES (900, 'x')")   # would touch another page
+        # journal was cut back to the last complete entry, then the whole
+        # transaction was rolled back and closed
+        self.assertFalse(self.engine._in_transaction)
+        self.assertEqual(self.engine._journal.size(), 0)
+        self.assertEqual(self.ids(), before)                         # row 3 is back
+        with self.assertRaises(ValueError):
+            self.engine.execute_sql("COMMIT")                        # no transaction in progress
+        # and a later transaction is still recoverable after a crash
+        self.engine.execute_sql("BEGIN")
+        self.engine.execute_sql("DELETE FROM t WHERE id = 5")
+        self.engine.close()
+        self.engine = Engine(data_dir=TEST_DATA_DIR)
+        self.assertEqual(self.ids(), before)
+        self.assertGreater(jsize, 0)
+
     def test_torn_journal_entry_is_ignored(self):
         self.engine.execute_sql("BEGIN")
         self.engine.execute_sql("DELETE FROM t WHERE id = 3")

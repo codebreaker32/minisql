@@ -29,6 +29,12 @@ rule too); the engine then clears the journal whenever the file holds any
 bytes at all, so a torn first entry can't linger and hide the entries of a
 later transaction from recovery.
 
+I/O is done on a raw file descriptor, unbuffered: an append is one
+os.write, so if it fails part-way (disk full, I/O error) the number of
+bytes that landed is known and the file is truncated back to the entry's
+start before the error propagates — the journal stays parseable, and the
+engine aborts the transaction on top of that.
+
 Write-ahead ordering, the whole point: the entry reaches the journal — and
 the disk, in durable mode — *before* the page changes. Clearing the journal
 is the commit point, and the engine fsyncs the heap files first.
@@ -47,20 +53,25 @@ _PAGE = struct.Struct(">QI")     # page number, image length
 _CRC = struct.Struct(">I")
 
 
+class JournalWriteError(OSError):
+    """An append failed and the journal could not be repaired: the caller
+    must treat the transaction as lost."""
+
+
 class UndoJournal:
     def __init__(self, path: str, sync: bool = True):
         self.path = path
         self.sync = sync
-        self._f = open(path, "a+b")
+        self._fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
 
     def close(self) -> None:
-        if not self._f.closed:
-            self._f.close()
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
 
     def size(self) -> int:
         """Bytes in the file — non-zero even when no entry parses (torn head)."""
-        self._f.seek(0, os.SEEK_END)
-        return self._f.tell()
+        return os.fstat(self._fd).st_size
 
     @staticmethod
     def _encode(kind: int, table: str, page_no: int, image: bytes | None) -> bytes:
@@ -69,17 +80,41 @@ class UndoJournal:
         body = _HDR.pack(kind, len(name)) + name + _PAGE.pack(page_no, len(image)) + image
         return body + _CRC.pack(zlib.crc32(body) & 0xFFFFFFFF)
 
+    def _write_all(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            n = os.write(self._fd, view)
+            view = view[n:]
+
     def append(self, kind: int, table: str, page_no: int, image: bytes | None) -> None:
-        self._f.seek(0, os.SEEK_END)
-        self._f.write(self._encode(kind, table, page_no, image))
-        self._f.flush()
-        if self.sync:
-            os.fsync(self._f.fileno())
+        start = os.lseek(self._fd, 0, os.SEEK_END)
+        try:
+            self._write_all(self._encode(kind, table, page_no, image))
+            if self.sync:
+                os.fsync(self._fd)
+        except OSError as exc:
+            # Leave no torn entry behind: cut the file back to where this
+            # entry began so everything before it still parses.
+            try:
+                os.ftruncate(self._fd, start)
+                if self.sync:
+                    os.fsync(self._fd)
+            except OSError as exc2:
+                raise JournalWriteError(f"journal append failed and could not be repaired: {exc2}") from exc
+            raise JournalWriteError(f"journal append failed: {exc}") from exc
+
+    def _read_all(self) -> bytes:
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            chunk = os.read(self._fd, 1 << 20)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
 
     def entries(self) -> list[tuple[int, str, int, bytes | None]]:
         """Parse the journal; stops at the first short or corrupt entry."""
-        self._f.seek(0)
-        data = self._f.read()
+        data = self._read_all()
         out = []
         pos = 0
         while pos < len(data):
@@ -104,13 +139,12 @@ class UndoJournal:
 
     def rewrite(self, entries) -> None:
         """Replace the journal contents wholesale."""
-        self._f.seek(0)
-        self._f.truncate(0)
+        os.ftruncate(self._fd, 0)
+        os.lseek(self._fd, 0, os.SEEK_SET)
         for kind, table, page_no, image in entries:
-            self._f.write(self._encode(kind, table, page_no, image))
-        self._f.flush()
+            self._write_all(self._encode(kind, table, page_no, image))
         if self.sync:
-            os.fsync(self._f.fileno())
+            os.fsync(self._fd)
 
     def clear(self) -> None:
         """The commit point."""

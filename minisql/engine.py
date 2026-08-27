@@ -38,7 +38,7 @@ from .ast_nodes import (
 from .catalog import Catalog, TableSchema
 from .storage.heap import HeapFile
 from .storage.btree import BTree
-from .storage.journal import UndoJournal, PRE_IMAGE, NEW_PAGE
+from .storage.journal import UndoJournal, JournalWriteError, PRE_IMAGE, NEW_PAGE
 from .planner import (
     build_plan, explain as explain_plan, validate_where,
     _split_conjuncts, pick_index_conjunct, _and_together,
@@ -68,6 +68,7 @@ class Engine:
         # first touched by the *current statement*, used to undo just that
         # statement on failure without disturbing the rest of the transaction.
         self._stmt_images: dict[tuple[str, int], bytes | None] = {}
+        self._journal_failed = False
         # Validate every table's heap header before touching the journal, so a
         # data directory from before page-based storage fails loudly at open
         # (with the "older MiniSQL" message) instead of on first table access
@@ -121,7 +122,15 @@ class Engine:
             self._stmt_images[key] = old_image
         if key not in self._txn_saved:
             kind = NEW_PAGE if old_image is None else PRE_IMAGE
-            self._journal.append(kind, table, page_no, old_image)
+            try:
+                self._journal.append(kind, table, page_no, old_image)
+            except JournalWriteError:
+                # The page has NOT been modified (the hook runs first), but
+                # the journal can no longer be trusted to describe the rest
+                # of this transaction: abort the whole transaction, like
+                # SQLite does on a journal I/O error. execute_sql does it.
+                self._journal_failed = True
+                raise
             self._txn_entries.append((kind, table, page_no, old_image))
             self._txn_saved.add(key)
 
@@ -352,6 +361,15 @@ class Engine:
             try:
                 result = self._execute_dml(stmt)
             except Exception:
+                if self._journal_failed:
+                    # A journal write failed: undo everything this transaction
+                    # did from the in-memory pre-images (all of which reached
+                    # the journal before their pages changed), clear the
+                    # journal, and end the transaction.
+                    self._journal_failed = False
+                    self._rollback_transaction()
+                    self._in_transaction = False
+                    raise
                 self._rollback_statement()
                 if not self._in_transaction:
                     self._commit_point()  # autocommit: the no-op is now durable
