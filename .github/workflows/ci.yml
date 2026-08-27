@@ -51,9 +51,9 @@ jobs:
     name: Lint (ruff + black)
     runs-on: ubuntu-latest
     # The formatters were configured in #6 but the codebase hasn't been
-    # formatted yet, so this job reports without blocking merges. Once a
-    # formatting-only PR lands, delete the next line to make it required.
-    continue-on-error: true
+    # formatted yet, so the two lint steps report (as warning annotations)
+    # without failing the job. Once a formatting-only PR lands, delete the
+    # two `continue-on-error` lines below to make lint required.
     steps:
       - uses: actions/checkout@v4
 
@@ -67,7 +67,9 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: ruff
+        continue-on-error: true
         run: ruff check --output-format=github .
 
       - name: black
+        continue-on-error: true
         run: black --check --diff .
