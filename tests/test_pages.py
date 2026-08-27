@@ -113,10 +113,41 @@ class HeapPageLayoutTest(unittest.TestCase):
                 self.assertEqual(f.read(1)[0], PAGE_DATA)
             self.assertEqual([heap.read(r)["i"] for r in rowids], list(range(40)))   # reads fault pages back in
             self.assertEqual(len(heap), 40)
-            heap.flush()
-            self.assertLessEqual(len(heap._cache), 2)             # flush trims to the cap too
+            self.assertLessEqual(len(heap._cache), 2)             # …and the reads evicted too
         finally:
             heap.close()
+
+    def test_page_size_must_be_an_int(self):
+        with self.assertRaises(ValueError):
+            HeapFile(os.path.join(TEST_DATA_DIR, "float.tbl"), page_size=1024.0)
+        self.assertFalse(os.path.exists(os.path.join(TEST_DATA_DIR, "float.tbl")))
+
+    def test_old_format_file_with_full_header_length_is_also_rejected(self):
+        path = os.path.join(TEST_DATA_DIR, "old_long.tbl")
+        with open(path, "wb") as f:                                 # a real pre-pages record: L + u32 len + pickle
+            f.write(b"L" + (30).to_bytes(4, "big") + b"\x80\x04\x95" + b"x" * 27)
+        with self.assertRaisesRegex(ValueError, "older MiniSQL"):
+            HeapFile(path)
+
+    def test_restore_of_torn_last_data_page_keeps_last_page_pointer(self):
+        # The last data page's type byte is destroyed on disk (a zero-filled
+        # block after a crash). Startup skips it; recovery restores it; the
+        # next insert must go there, not to a fresh page.
+        rowids = [self.heap.insert({"i": i, "pad": "x" * 1000}) for i in range(4)]   # page 1 full-ish, page 2 has 1 row
+        self.assertEqual(split_rowid(rowids[-1])[0], 2)
+        self.heap.flush()
+        image2 = bytes(self.heap.read_page(2))
+        self.heap.close()
+        with open(self.path, "r+b") as f:
+            f.seek(2 * PAGE_SIZE)
+            f.write(b"\x00" * PAGE_SIZE)
+        self.heap = HeapFile(self.path)
+        self.assertEqual(self.heap._last_data_page, 1)              # torn page skipped at open
+        self.heap.restore_page(2, image2)
+        self.assertEqual(self.heap._last_data_page, 2)              # pointer follows the restored image
+        r = self.heap.insert({"i": 4, "pad": "x" * 1000})
+        self.assertEqual(split_rowid(r), (2, 1))
+        self.assertEqual([row["i"] for _, row in self.heap.scan()], [0, 1, 2, 3, 4])
 
     def test_page_size_must_fit_u16_fields(self):
         for bad in (65536, 100):
@@ -145,8 +176,10 @@ class HeapPageLayoutTest(unittest.TestCase):
         self.heap._find_last_data_page = lambda: (calls.append(1), real())[1]
         self.heap.restore_page(1, image)                          # existing page: no rescan
         self.assertEqual(calls, [])
-        self.heap.restore_page(self.heap.page_count(), image)     # extending the file: rescan needed
-        self.assertEqual(len(calls), 1)
+        new_page = self.heap.page_count()
+        self.heap.restore_page(new_page, image)                   # extending the file: still no rescan —
+        self.assertEqual(calls, [])                               # the restored image says it is a data page,
+        self.assertEqual(self.heap._last_data_page, new_page)     # so the pointer just follows it
 
     def test_page_write_hook_sees_pre_image_or_none(self):
         events = []
@@ -172,7 +205,8 @@ class PageJournalRecoveryTest(unittest.TestCase):
         self.engine.execute_sql("COMMIT")
 
     def tearDown(self):
-        self.engine.close()
+        if self.engine is not None:
+            self.engine.close()
         shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
 
     def ids(self, engine=None):
@@ -223,6 +257,37 @@ class PageJournalRecoveryTest(unittest.TestCase):
         self.engine.close()
         self.engine = Engine(data_dir=TEST_DATA_DIR)
         self.assertEqual(self.ids(), list(range(120)) + [900])
+
+    def test_failed_statement_truncates_pages_it_allocated(self):
+        before_pages, before_ids = self.pages(), self.ids()
+        self.engine.execute_sql("BEGIN")
+        with self.assertRaises(ValueError):
+            # each new version is 3 KB, so the first row forces a new data page
+            # (and the 9 KB one an overflow chain) before the duplicate key fails
+            self.engine.execute_sql(f"UPDATE t SET id = 5000, pad = '{'y' * 3000}' WHERE id > 117")
+        self.assertEqual(self.pages(), before_pages)                # allocated pages truncated away
+        self.assertEqual(self.ids(), before_ids)
+        with self.assertRaises(ValueError):
+            self.engine.execute_sql(f"UPDATE t SET id = 5000, pad = '{'y' * 9000}' WHERE id > 117")
+        self.assertEqual(self.pages(), before_pages)
+        self.engine.execute_sql("COMMIT")
+        self.engine.close()
+        self.engine = Engine(data_dir=TEST_DATA_DIR)
+        self.assertEqual(self.ids(), before_ids)
+
+    def test_pre_pages_directory_fails_at_open_without_touching_its_journal(self):
+        self.engine.close()
+        # Fake a directory written by the byte-append engine: catalog present,
+        # an old-format table file, and a non-empty old text journal.
+        with open(os.path.join(TEST_DATA_DIR, "t.tbl"), "wb") as f:
+            f.write(b"L" + (30).to_bytes(4, "big") + b"\x80\x04\x95" + b"x" * 27)
+        jpath = os.path.join(TEST_DATA_DIR, "undo.journal")
+        with open(jpath, "wb") as f:
+            f.write(b"insert t 47\n")
+        with self.assertRaisesRegex(ValueError, "older MiniSQL"):
+            Engine(data_dir=TEST_DATA_DIR)
+        self.assertEqual(open(jpath, "rb").read(), b"insert t 47\n")   # untouched
+        self.engine = None
 
     def test_crash_mid_transaction_recovers_from_pre_images(self):
         self.engine.execute_sql("BEGIN")

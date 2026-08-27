@@ -203,13 +203,14 @@ below for the one exception).
 - Pages go through a small **write-back cache** (256 pages per table — a
   buffer pool): modified pages are marked dirty and written when evicted,
   on `flush()`, or at the commit point; the cap is enforced on reads and
-  writes alike, and a commit trims the cache back to it. This is why bulk
+  writes alike. This is why bulk
   loads inside a transaction are fast: a page filling up with 80 rows is
   written once, not 80 times.
 - **Format note:** data directories written before page-based storage
-  (the byte-append `.tbl` format) are not readable; opening one gives a
-  clear error. There is no migration — delete the directory (the REPL's
-  default is `data/`).
+  (the byte-append `.tbl` format) are not readable; `Engine()` validates
+  every table's header at open and fails with a clear error before
+  touching anything. There is no migration — delete the directory (the
+  REPL's default is `data/`).
 
 ### How transactions work (page-image rollback journal + write-ahead ordering)
 

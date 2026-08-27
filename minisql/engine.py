@@ -68,13 +68,20 @@ class Engine:
         # first touched by the *current statement*, used to undo just that
         # statement on failure without disturbing the rest of the transaction.
         self._stmt_images: dict[tuple[str, int], bytes | None] = {}
+        # Validate every table's heap header before touching the journal, so a
+        # data directory from before page-based storage fails loudly at open
+        # (with the "older MiniSQL" message) instead of on first table access
+        # — and before _recover() could clear its old-format journal.
+        for table in self.catalog.tables:
+            self.get_heap(table)
         self._journal = UndoJournal(self.catalog.journal_path(), sync=sync)
         self._recover()
 
     def close(self) -> None:
         for heap in self._heaps.values():
             heap.close()
-        self._journal.close()
+        if hasattr(self, "_journal"):
+            self._journal.close()
 
     # ---------------- storage accessors ----------------
 
