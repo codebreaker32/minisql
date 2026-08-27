@@ -1,9 +1,9 @@
 # MiniSQL
 
 A SQL query engine built from scratch in Python: lexer → parser → AST →
-query planner → Volcano-model executor, backed by a custom heap-file
-storage layer, a hand-written B-tree index, and an on-disk undo journal
-for crash-safe transactions.
+query planner → Volcano-model executor, backed by a page-based heap
+storage layer with a write-back page cache, a hand-written B-tree index,
+and an on-disk page-image rollback journal for crash-safe transactions.
 
 No SQLite, no ORM, no existing query engine used anywhere in the execution
 path. SQLite is used **only** in the test suite, as a ground-truth oracle to
@@ -24,16 +24,16 @@ SQL text
    ▼
  executor.py     execute()           plan tree -> generator of row dicts
    │
-   ├── storage/heap.py     HeapFile     append-only row storage on disk
-   ├── storage/btree.py    BTree        B-tree index: column value -> rowids
-   └── storage/journal.py  UndoJournal  write-ahead undo log for ROLLBACK + crash recovery
+   ├── storage/heap.py     HeapFile     slotted 4 KB pages + overflow pages, page cache
+   ├── storage/btree.py    BTree        B-tree index: column value -> rowids (page, slot)
+   └── storage/journal.py  UndoJournal  page-image rollback journal for ROLLBACK + crash recovery
 ```
 
 ## Quick start
 
 ```bash
-# run the test suite (72 tests: B-tree, SQLite cross-checks, constraints,
-# NULL semantics, transactions, crash recovery, aggregates)
+# run the test suite (88 tests: B-tree, page storage, SQLite cross-checks,
+# constraints, NULL semantics, transactions, crash recovery, aggregates)
 python3 -m unittest discover tests -v
 
 # run the interactive REPL
@@ -72,9 +72,9 @@ Alice
 | `minisql/ast_nodes.py` | Dataclasses for every statement and expression type. |
 | `minisql/parser.py` | Hand-written recursive-descent parser. Tokens → AST. |
 | `minisql/catalog.py` | Table schemas + index metadata, persisted as JSON. |
-| `minisql/storage/heap.py` | Append-only row storage: `HeapFile`. Rowid = byte offset. Tombstone deletes. |
+| `minisql/storage/heap.py` | Page-based row storage: `HeapFile`. Slotted 4 KB pages, overflow chains for big rows, write-back page cache. Rowid = (page, slot). Tombstone deletes. |
 | `minisql/storage/btree.py` | From-scratch B-tree: insert (with node splitting), point search, pruned range search, NULL-safe keys. |
-| `minisql/storage/journal.py` | On-disk undo journal: written before every heap change, cleared at commit. |
+| `minisql/storage/journal.py` | Page-image rollback journal (SQLite-style): a page's original bytes are saved before its first modification in a transaction; cleared at commit. |
 | `minisql/planner.py` | Semantic analysis (unknown/ambiguous columns) + AST → plan tree. Decides IndexScan vs SeqScan per table, including under a join. Powers `EXPLAIN`. |
 | `minisql/executor.py` | Interprets the plan tree, Volcano/iterator style (generators). SQL NULL semantics. |
 | `minisql/engine.py` | Top-level `Engine.execute_sql()`: constraint enforcement, write path, transactions, recovery. |
@@ -84,6 +84,7 @@ Alice
 | `tests/test_correctness.py` | Full-engine correctness, cross-checked against real SQLite. |
 | `tests/test_transactions_and_aggregates.py` | BEGIN/COMMIT/ROLLBACK semantics; COUNT/SUM/AVG/MIN/MAX/GROUP BY, cross-checked against SQLite. |
 | `tests/test_constraints_and_recovery.py` | PRIMARY KEY / type / NOT NULL enforcement, NULL semantics, name resolution, index use under joins, statement atomicity, crash recovery, B-tree pruning. |
+| `tests/test_pages.py` | Slotted-page layout, rowid = (page, slot), overflow rows, page-cache write-back and eviction, page-image rollback, recovery of a corrupted middle page and a torn journal entry. |
 
 ## Development
 
@@ -177,43 +178,81 @@ unknown.
 | `SELECT 1` (no `FROM`), scalar functions | Every query is a scan of a table | A one-row `ValuesNode` |
 | `--` comments, several statements per call | The lexer and REPL handle one statement string | Skip `--…\n` in the lexer's whitespace group; split on `;` outside strings |
 
-### How transactions work (undo journal + write-ahead ordering)
+### How the heap stores a table (pages)
+
+A table is one file, `users.tbl`, made of fixed-size 4 KB pages: page 0 is
+a file header (magic, format version, page size); every other page is a
+**data page** or an **overflow page**. A data page is a classic *slotted
+page*: a 5-byte header (`type`, `num_slots`, `free_upper`), a slot array
+growing forward from the front (`offset`, `length`, `flags` per slot), and
+the pickled row payloads growing backward from the end of the page. Free
+space is the gap between them.
+
+A row's **rowid is `(page_no << 16) | slot_no`** — the same shape as
+Postgres's `ctid (block, offset)`. An index stores that number; fetching a
+row by rowid is one page read plus a slot lookup. Slots are never reused,
+so rowids stay stable for the life of the file (see the ROLLBACK caveat
+below for the one exception).
+
+- **INSERT** appends a slot to the last data page if the payload fits,
+  otherwise allocates a new page. A row bigger than a page goes into a
+  chain of overflow pages and the slot holds a pointer to the chain (the
+  same idea as Postgres TOAST).
+- **DELETE** clears the slot's live bit — a tombstone; the payload stays.
+- **UPDATE** is a tombstone plus a fresh insert (below).
+- Pages go through a small **write-back cache** (256 pages per table — a
+  buffer pool): modified pages are marked dirty and written when evicted,
+  on `flush()`, or at the commit point. This is why bulk loads inside a
+  transaction are fast: a page filling up with 80 rows is written once,
+  not 80 times.
+
+### How transactions work (page-image rollback journal + write-ahead ordering)
 
 There are two classical techniques real databases use to implement atomic
 `ROLLBACK`: **shadow paging** (never overwrite a page in place; commit by
-swapping a pointer to the new version) and **undo/redo logging** (write
-changes immediately, but log enough information to undo them if the
-transaction aborts). MiniSQL implements a small, real version of the
-second technique, on disk:
+swapping a pointer to the new version) and **logging** (write changes in
+place, but log enough to undo them if the transaction aborts). MiniSQL
+implements the logging technique the way SQLite's rollback-journal mode
+does — by saving **page images**:
 
-- Before every heap mutation, one line is appended to `undo.journal`:
-  `insert <table> <rowid>` or `delete <table> <rowid>`. In the default
-  durable mode the journal is fsync'd before the heap is touched — the
-  **write-ahead rule**: the disk always knows how to undo anything that may
-  have happened.
-- `ROLLBACK` replays the journal in reverse: undo an `insert` by
-  tombstoning that rowid; undo a `delete` by resurrecting it
-  (`HeapFile.undelete`).
-- The **commit point** — `COMMIT`, or the end of every autocommit statement —
-  fsyncs the heap files and *then* clears the journal. That order matters:
-  clearing first could lose a committed write with nothing left to recover from.
+- Before the heap modifies a page for the first time in a transaction, it
+  calls the engine's `on_page_write` hook; the engine appends the page's
+  original bytes (a *pre-image*) to `undo.journal` — or a *new-page* record
+  if the page is being allocated. In durable mode the journal is fsync'd
+  before the page changes. That is the **write-ahead rule**: the disk
+  always holds enough to undo anything that may have happened.
+- `ROLLBACK` copies every pre-image back over its page, newest first, and
+  truncates the file below the lowest new page.
+- The **commit point** — `COMMIT`, or the end of every autocommit
+  statement — flushes dirty pages, fsyncs the heap files, and *then* clears
+  the journal. That order matters: clearing first could lose a committed
+  write with nothing left to recover from.
 - **Recovery**: if the engine starts and the journal is non-empty, the
-  previous process died mid-transaction. It undoes the journaled changes in
-  reverse; an interrupted `insert` is undone by truncating the heap back to
-  that offset (journaled inserts are always the file's tail, since the
-  journal is cleared at every commit point), which also discards a torn,
-  half-written record.
+  previous process died mid-transaction; it replays the journal exactly as
+  a `ROLLBACK` would. Because the journal holds whole pages, this also
+  repairs a **torn page** — a crash halfway through rewriting a page in the
+  middle of the file, which would otherwise corrupt rows committed long
+  ago. (A rowid-level undo log, which MiniSQL used before it had pages,
+  cannot fix that; Postgres solves it with full-page writes in its WAL.)
+  Each journal entry carries a CRC so a torn *journal* entry is ignored —
+  safe, because a page is never touched until its entry is complete.
 - A statement that raises (constraint violation, bad column) is rolled
-  back to the position the journal was at when the statement began, so an
-  enclosing transaction's earlier statements survive.
+  back from an in-memory **statement journal** — the pre-image of every
+  page the statement touched, taken at its start — so an enclosing
+  transaction's earlier statements survive. SQLite has the same split
+  between its rollback journal and its statement journal.
 
-No index bookkeeping is needed on rollback: since a loaded B-tree index is
-never modified by delete/undelete (this B-tree has no delete operation —
-see Limitations), resurrecting a row via `undelete()` makes it findable via
-the index again automatically, because every index read path already
-filters on `heap.read(rowid) is not None`. Live rollback tombstones rather
-than truncates for the same reason: a loaded index may still point at that
-offset, and an offset must never be reused while it does.
+Why page images rather than "undo this rowid": with pages, inserting into a
+half-full page rewrites the whole page. Only a copy of the page's earlier
+bytes can repair a crash in the middle of that write.
+
+**The one index consequence.** Restoring a page's earlier image frees the
+slots that were added after it, and the next insert will reuse them. Any
+loaded B-tree index that still holds entries for those rowids would then
+point at the wrong row — so rollback (statement or transaction) drops the
+in-memory indexes of every table it touched, and they are rebuilt from the
+heap on next use. Outside rollback, stale index entries for tombstoned rows
+are harmless: every index read path filters on `heap.read(rowid) is None`.
 
 `Engine(data_dir, sync=False)` keeps the journal but skips the fsyncs
 (the same knob as SQLite's `PRAGMA synchronous=OFF`) — that's what the
@@ -242,10 +281,11 @@ real engines enforce.
 
 ### How UPDATE works
 
-`UPDATE` never rewrites bytes in place. It tombstones the old row version and
-appends the new one as a fresh row with a fresh rowid — mirroring how
-Postgres actually implements `UPDATE` internally (a new tuple version,
-the old one marked dead for a later `VACUUM`). `DELETE` just tombstones.
+`UPDATE` never edits a row in place. It tombstones the old row version and
+inserts the new one as a fresh row with a fresh rowid (a new slot) —
+mirroring how Postgres actually implements `UPDATE` internally (a new tuple
+version, the old one marked dead for a later `VACUUM`). `DELETE` just
+tombstones.
 Matching rows are materialized before any mutation so the statement can't
 re-match the rows it just appended (the "Halloween problem").
 
@@ -255,7 +295,7 @@ removed. When that entry is looked up later, `heap.read(rowid)` returns
 `None` for a tombstoned row, and every index read path — `IndexScan`, the
 `UPDATE`/`DELETE` row matcher, and the primary-key uniqueness check —
 filters those `None`s out. So results are always correct — but, exactly
-like a real un-vacuumed Postgres table, the heap file and index accumulate
+like a real un-vacuumed Postgres table, the pages and the index accumulate
 dead entries over time.
 
 ## Engine internals deliberately left out — and why
@@ -265,9 +305,11 @@ dead entries over time.
   there's only ever one writer. Real MVCC (Postgres) or 2PL (traditional
   locking) solve a fundamentally harder problem: multiple transactions in
   flight at once.
-- **No `VACUUM` / compaction.** Tombstoned rows and their stale index
-  entries are never physically reclaimed, so the heap file and B-tree only
-  grow. A production engine periodically compacts; this one doesn't.
+- **No `VACUUM` / compaction.** Tombstoned rows (and the overflow pages of
+  deleted big rows) and stale index entries are never physically
+  reclaimed, and freed space inside a page is never reused, so the heap
+  file and B-tree only grow. A production engine periodically compacts;
+  this one doesn't.
 - **The B-tree has no delete operation.** Removing a key from a B-tree
   correctly (rebalancing after underflow, merging sibling nodes) is
   meaningfully more code than insertion. Rather than half-implement it,
@@ -284,13 +326,17 @@ dead entries over time.
   Same O(log n + k) complexity, weaker constant factor.
 - **In-memory indexes, rebuilt on demand.** Indexes aren't serialized to
   disk; they're rebuilt by scanning the heap file the first time they're
-  needed after a process restart. Fine for a teaching/demo engine, not for
-  a real database with fast-restart requirements.
+  needed after a process restart (and after a ROLLBACK that touched the
+  table). Now that the heap is paged, a disk-resident B+tree whose nodes
+  are pages is the natural next step.
 - **No query cost estimation.** The planner always uses an index if one
   exists on an eligible column (`= < <= > >=`; never `!=`, which matches
   almost everything) — it has no row-count statistics or selectivity
   estimates to decide an index scan might actually be worse.
 - **Rows are pickled.** A real engine packs typed columns with fixed
   layouts so it can read one column without decoding the row.
+- **The page cache is per table and write-back only.** There is no shared
+  buffer pool with a global memory budget, no read-ahead, and eviction is
+  plain LRU.
 - **GROUP BY is single-column only**, there's no `HAVING`, `ORDER BY`
   takes one key, and there are no arithmetic expressions (`age + 1`).
