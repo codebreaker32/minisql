@@ -26,6 +26,7 @@ class TransactionTest(unittest.TestCase):
         self.engine.execute_sql("INSERT INTO users VALUES (2, 'Bob', 25)")
 
     def tearDown(self):
+        self.engine.close()
         if os.path.exists(TEST_DATA_DIR):
             shutil.rmtree(TEST_DATA_DIR)
 
@@ -117,6 +118,7 @@ class AggregateTest(unittest.TestCase):
         self.sqlite.commit()
 
     def tearDown(self):
+        self.engine.close()
         self.sqlite.close()
         if os.path.exists(TEST_DATA_DIR):
             shutil.rmtree(TEST_DATA_DIR)

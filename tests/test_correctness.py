@@ -53,6 +53,7 @@ class CorrectnessTest(unittest.TestCase):
         self.sqlite.commit()
 
     def tearDown(self):
+        self.engine.close()
         self.sqlite.close()
         if os.path.exists(TEST_DATA_DIR):
             shutil.rmtree(TEST_DATA_DIR)

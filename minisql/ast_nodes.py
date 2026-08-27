@@ -4,8 +4,8 @@ ast_nodes.py — AST node definitions.
 Every parsed SQL statement becomes one of these dataclasses. Expressions
 (WHERE clauses, join conditions) are represented as a small recursive
 expression tree: Literal / ColumnRef are leaves, BinOp is the only internal
-node type (it covers both comparisons like `age > 25` and boolean logic like
-`a AND b`, distinguished by the `op` field).
+node type (it covers comparisons like `age > 25`, null tests like
+`age IS NULL`, and boolean logic like `a AND b`, distinguished by `op`).
 """
 
 from __future__ import annotations
@@ -26,13 +26,13 @@ class Literal(Expr):
 @dataclass
 class ColumnRef(Expr):
     name: str
-    table: str | None = None  # set when qualified, e.g. t1.col
+    table: str | None = None  # set when qualified, e.g. t1.col (or resolved by the planner)
 
 
 @dataclass
 class BinOp(Expr):
     left: Expr
-    op: str   # one of: = != < <= > >= AND OR
+    op: str   # one of: = != < <= > >= IS "IS NOT" AND OR
     right: Expr
 
 
@@ -85,7 +85,7 @@ class SelectStmt:
     join: JoinClause | None = None
     where: Expr | None = None
     group_by: str | None = None
-    order_by: str | None = None
+    order_by: object = None       # column name (str) or AggExpr, e.g. ORDER BY COUNT(*)
     order_desc: bool = False
     limit: int | None = None
 

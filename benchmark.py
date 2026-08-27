@@ -30,7 +30,9 @@ DATA_DIR = "bench_data"
 def build_table(n_rows: int) -> Engine:
     if os.path.exists(DATA_DIR):
         shutil.rmtree(DATA_DIR)
-    engine = Engine(data_dir=DATA_DIR)
+    # sync=False: skip fsync during the bulk load (like PRAGMA synchronous=OFF).
+    # Query timings are unaffected; only load time is.
+    engine = Engine(data_dir=DATA_DIR, sync=False)
     engine.execute_sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
     random.seed(0)
     names = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Heidi"]
@@ -64,6 +66,7 @@ def run_single_size_report(n_rows: int, lookup_age: int = 42):
 
     speedup = seq_time / idx_time if idx_time > 0 else float("inf")
     print(f"  Speedup:               {speedup:8.1f}x")
+    engine.close()
     return seq_time, idx_time
 
 

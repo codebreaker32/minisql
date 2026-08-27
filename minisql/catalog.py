@@ -4,7 +4,8 @@ catalog.py — System catalog: table schemas and index metadata.
 Real databases keep this in special system tables (pg_catalog, INFORMATION_SCHEMA).
 MiniSQL keeps it simple: a JSON file listing each table's columns and which
 columns have indexes. The catalog is the thing the planner consults to decide
-"is there an index I can use for this WHERE clause?"
+"is there an index I can use for this WHERE clause?" and the thing the engine
+consults to enforce column types and the PRIMARY KEY constraint.
 """
 
 from __future__ import annotations
@@ -21,6 +22,18 @@ class TableSchema:
 
     def column_names(self) -> list[str]:
         return [c["name"] for c in self.columns]
+
+    def column_type(self, name: str) -> str:
+        for c in self.columns:
+            if c["name"] == name:
+                return c["type"]
+        raise ValueError(f"Column {name!r} not found on table {self.name!r}")
+
+    def pk_column(self) -> str | None:
+        for c in self.columns:
+            if c.get("primary_key"):
+                return c["name"]
+        return None
 
 
 class Catalog:
@@ -46,6 +59,11 @@ class Catalog:
     def create_table(self, name: str, columns: list[dict]) -> None:
         if name in self.tables:
             raise ValueError(f"Table {name!r} already exists")
+        names = [c["name"] for c in columns]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Duplicate column name in table {name!r}")
+        if sum(1 for c in columns if c.get("primary_key")) > 1:
+            raise ValueError("A table may have at most one PRIMARY KEY column")
         self.tables[name] = TableSchema(name=name, columns=columns)
         self._save()
 
@@ -68,5 +86,5 @@ class Catalog:
     def heap_path(self, table_name: str) -> str:
         return os.path.join(self.data_dir, f"{table_name}.tbl")
 
-    def index_path(self, table_name: str, column: str) -> str:
-        return os.path.join(self.data_dir, f"{table_name}__{column}.idx")
+    def journal_path(self) -> str:
+        return os.path.join(self.data_dir, "undo.journal")

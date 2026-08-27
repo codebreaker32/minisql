@@ -1,0 +1,5 @@
+.env/
+__pycache__/
+*.pyc
+bench_data/
+tests/_tmp_*/
