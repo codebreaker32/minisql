@@ -98,30 +98,84 @@ black .
 ruff check .
 ```
 
-## What's implemented
+## Supported SQL
 
-- DDL: `CREATE TABLE` (with `PRIMARY KEY`, always index-backed), `CREATE INDEX`
-- DML: `INSERT` (full or partial column list), `SELECT`, `UPDATE`, `DELETE`
-- Constraints, enforced on every write: column types (`INT`/`INTEGER`,
-  `REAL`/`FLOAT` with int→real widening, `TEXT`/`VARCHAR`), `PRIMARY KEY`
-  uniqueness and `NOT NULL`
-- `WHERE` with `=, !=, <>, <, <=, >, >=, AND, OR, IS NULL, IS NOT NULL`,
-  with SQL NULL semantics (a comparison with NULL is never true)
-- `GROUP BY`, aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`;
-  `ORDER BY` an aggregate (`ORDER BY COUNT(*) DESC`)
-- `ORDER BY ... ASC/DESC` (NULLs first, as in SQLite), `LIMIT`
-- `INNER JOIN ... ON` (equi-join, nested loop); unqualified column names are
-  resolved to their table and rejected if ambiguous
-- `BEGIN` / `COMMIT` / `ROLLBACK` — atomic transactions via an on-disk undo
-  journal, with automatic recovery of an interrupted transaction on restart
-- Statement-level atomicity: a statement that fails halfway (e.g. an
-  `UPDATE` whose third row would violate the primary key) is undone completely
-- `EXPLAIN` (prints the plan tree without executing it)
-- Non-unique B-tree indexes (duplicate keys and NULLs supported)
-- Automatic index-vs-scan selection in the planner — for each table of a
-  join, and for `UPDATE`/`DELETE`, not just `SELECT`
-- Reserved words usable as names where unambiguous (`key`, `count`, `text`,
-  ...) and `"double-quoted"` identifiers for everything else
+This is the complete grammar. If a form isn't listed here, the parser
+rejects it with a `ParseError` naming the token it stopped at — nothing is
+silently ignored. Keywords are case-insensitive; a trailing `;` is optional;
+one statement per call.
+
+### Statements
+
+| Statement | Exact form |
+|---|---|
+| Create table | `CREATE TABLE t (col TYPE [PRIMARY KEY], col TYPE, ...)` — at most one `PRIMARY KEY`; it is automatically index-backed |
+| Create index | `CREATE INDEX name ON t (col)` — single column, non-unique, may contain duplicates and NULLs |
+| Insert | `INSERT INTO t VALUES (v, v, ...)` or `INSERT INTO t (col, col) VALUES (v, v)` — one row; unlisted columns become NULL |
+| Select | `SELECT items FROM t [JOIN u ON a = b] [WHERE pred] [GROUP BY col] [ORDER BY item [ASC\|DESC]] [LIMIT n]` — clauses in this order |
+| Update | `UPDATE t SET col = literal [, col = literal] [WHERE pred]` |
+| Delete | `DELETE FROM t [WHERE pred]` |
+| Transactions | `BEGIN [TRANSACTION]`, `COMMIT`, `ROLLBACK` — one level, no savepoints |
+| Explain | `EXPLAIN SELECT ...` — prints the plan tree, runs nothing |
+
+### Pieces
+
+| Piece | What's accepted |
+|---|---|
+| Types | `INT` / `INTEGER`, `REAL` / `FLOAT`, `TEXT` / `VARCHAR` — no length or precision (`VARCHAR(30)` is rejected; use `VARCHAR`) |
+| Literals | integers `42`, reals `3.14`, strings `'single-quoted'` (escape a quote as `\'`), `TRUE` / `FALSE` (stored as 1 / 0 in an INT column), `NULL` |
+| Identifiers | `name`, `table.name`, `"double-quoted"` for any name at all. Type names, aggregate names, `KEY`, `INDEX`, `TRANSACTION` can be used unquoted as column names (`key`, `count`, `text`, ...) |
+| Select items | `*`, `col`, `table.col`, `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` |
+| Join | `[INNER] JOIN u ON t.a = u.b` — one join per query, equality only, both sides column references |
+| WHERE predicate | comparisons `col OP literal` / `literal OP col` / `col OP col` with `= != <> < <= > >=`; `col IS NULL`; `col IS NOT NULL`; combined with `AND` / `OR` (AND binds tighter, both left-associative). No parentheses, no `NOT` |
+| GROUP BY | one column; every non-aggregate select item must be that column; `GROUP BY` with no aggregate returns the distinct values |
+| ORDER BY | one key: a column, or an aggregate that appears in the select list (`ORDER BY COUNT(*) DESC`); NULLs sort first ascending (as in SQLite) |
+| LIMIT | non-negative integer; no `OFFSET` |
+
+### Semantics you can rely on
+
+- **Constraints are enforced on every write**: values must match the column
+  type (an integer is widened to REAL; anything else is an error), the
+  primary key is unique and NOT NULL. A violating statement is rejected and
+  fully undone, even if it had already changed other rows.
+- **NULL** follows SQL: any comparison involving NULL is not true, so
+  `WHERE age = NULL` and `WHERE age > 25` both exclude NULL rows; `IS NULL`
+  is the only way to find them. Aggregates other than `COUNT(*)` ignore
+  NULLs. A NULL join key never matches. `GROUP BY` treats NULL as one group.
+- **Names are checked before anything runs**: an unknown column or table is
+  an error; an unqualified column that exists in both joined tables is an
+  error asking you to qualify it.
+- **Indexes are used automatically** when a `WHERE` conjunct is
+  `col = / < / <= / > / >= literal` on an indexed column — for each table of
+  a join, and for `UPDATE` / `DELETE` as well as `SELECT`. `!=` never uses an
+  index. `EXPLAIN` shows the decision.
+- **Return values** from `Engine.execute_sql`: `list[dict]` for SELECT,
+  `str` for EXPLAIN, `int` rows affected for INSERT / UPDATE / DELETE,
+  `None` for DDL and transaction control.
+
+## Not supported — and why
+
+The grammar is deliberately narrow: the goal was depth in the engine layers
+(planner, executor, storage, recovery) rather than breadth of SQL. Each row
+says what it would take, so the omission is a scoping decision rather than an
+unknown.
+
+| Not supported | Why it's out | What it would take |
+|---|---|---|
+| `VARCHAR(n)`, `DECIMAL(p,s)`, `DATE`, `BOOLEAN` | The type system has three storage classes (int, float, str), like SQLite's; lengths and extra types add checks without teaching anything new about the engine | Parse the `(n)`; enforce `len()` in `_coerce`; a `DATE` needs a canonical encoding to sort correctly in the B-tree |
+| `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `FOREIGN KEY` | Only `PRIMARY KEY` was needed to demonstrate constraint enforcement through an index; the others are variations on the same check | `NOT NULL` / `DEFAULT`: catalog flag + check in `_build_row`. `UNIQUE`: the PK check on another index. `FOREIGN KEY`: a lookup on the referenced table's PK index at insert, and on delete |
+| `ALTER TABLE`, `DROP TABLE`, `DROP INDEX` | DDL is autocommit and not journaled, so a schema change can't be rolled back or recovered; adding more DDL before journaling the catalog would widen that gap | Journal catalog changes; `DROP` = remove from catalog + delete the heap file; `ADD COLUMN` = catalog change only (missing keys read as NULL) |
+| Multi-row `INSERT ... VALUES (...), (...)` | Pure parser convenience; the write path already handles one row at a time atomically | Loop in the parser; wrap in the existing statement-level rollback |
+| Expressions: arithmetic (`age + 1`), functions (`UPPER`), `SET col = col + 1` | The expression tree has exactly three node types (literal, column, binary op) so the planner's index-eligibility test stays a pattern match; a general expression evaluator is a separate project | A precedence-climbing expression parser and an `_eval` that handles arithmetic; `_is_indexable` would need to recognise `col OP constant-expression` |
+| Parentheses and `NOT` in `WHERE` | Three precedence levels were enough to show how precedence falls out of recursive descent; the conjunct splitter relies on a plain AND-chain | `(`…`)` as a primary in `parse_operand`; `NOT` as a unary node; push NOT down (De Morgan) so `_split_conjuncts` still sees ANDs |
+| `LIKE`, `IN`, `BETWEEN` | Syntactic sugar over comparisons; none affect the plan shape | `BETWEEN` → two conjuncts (index-eligible for free); `IN` → OR chain or a set membership node; `LIKE` → a pattern-match node, prefix patterns could use the index |
+| `DISTINCT`, `HAVING`, multi-column `GROUP BY`, `COUNT(DISTINCT)` | One-column hash aggregate shows the blocking-operator idea; the rest is generalisation | Tuple group keys; `HAVING` = a `Filter` above `Aggregate`; `DISTINCT` = `GROUP BY` all columns |
+| Multi-key `ORDER BY`, `OFFSET` | One key suffices to show a blocking sort | Tuple sort key; `OFFSET` = skip n in `LimitNode` |
+| Aliases (`AS`), table aliases, self-joins | Name resolution is by real table name; aliases need a scope-renaming layer | An alias map in `_Scope`; row qualification by alias instead of table |
+| `LEFT` / `RIGHT` / `FULL OUTER JOIN`, more than one join | Inner nested-loop join demonstrates the join operator; outer joins need NULL-padding and a "matched" flag per row; multiple joins need a join order | Track unmatched left rows and emit them with NULLs; a left-deep chain of `NestedLoopJoinNode`s |
+| Subqueries, `UNION` | Would require the planner to nest plans and the executor to materialise intermediate relations | A `SubqueryNode` whose child is a full plan; correlated subqueries need per-row re-execution |
+| `SELECT 1` (no `FROM`), scalar functions | Every query is a scan of a table | A one-row `ValuesNode` |
+| `--` comments, several statements per call | The lexer and REPL handle one statement string | Skip `--…\n` in the lexer's whitespace group; split on `;` outside strings |
 
 ### How transactions work (undo journal + write-ahead ordering)
 
@@ -204,7 +258,7 @@ filters those `None`s out. So results are always correct — but, exactly
 like a real un-vacuumed Postgres table, the heap file and index accumulate
 dead entries over time.
 
-## What's deliberately NOT implemented
+## Engine internals deliberately left out — and why
 
 - **No concurrency.** Transactions give you atomicity (all-or-nothing) and
   durability but not isolation between simultaneous transactions, because
