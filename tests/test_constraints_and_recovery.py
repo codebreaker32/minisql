@@ -11,11 +11,14 @@ import shutil
 import sqlite3
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from minisql.engine import Engine
 from minisql.parser import ParseError
 from minisql.storage.btree import BTree
+from minisql.storage.heap import HeapFile
+from minisql.storage.journal import UndoJournal
 
 TEST_DATA_DIR = os.path.join(os.path.dirname(__file__), "_tmp_constraints_test_data")
 
@@ -284,6 +287,48 @@ class AtomicityAndRecoveryTest(unittest.TestCase):
             f.truncate(os.path.getsize(path) - 3)
         self.engine = Engine(data_dir=TEST_DATA_DIR)
         self.assertEqual(self.snapshot(), before)
+
+    def _record_sync_order(self):
+        """Wrap HeapFile.sync and UndoJournal.rewrite so the order in which
+        they run is observable, without changing what they do."""
+        events = []
+        real_sync, real_rewrite = HeapFile.sync, UndoJournal.rewrite
+
+        def sync(heap):
+            events.append("heap-fsync")
+            real_sync(heap)
+
+        def rewrite(journal, entries):
+            events.append("journal-rewrite")
+            real_rewrite(journal, entries)
+
+        patches = [mock.patch.object(HeapFile, "sync", sync),
+                   mock.patch.object(UndoJournal, "rewrite", rewrite)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return events
+
+    def _assert_heap_synced_before_journal(self, events):
+        # The journal may only stop describing an undo once that undo is on
+        # disk: every journal rewrite must be preceded by a heap fsync.
+        self.assertIn("journal-rewrite", events)
+        self.assertIn("heap-fsync", events)
+        self.assertLess(events.index("heap-fsync"), events.index("journal-rewrite"),
+                        f"journal was rewritten before the heap was fsync'd: {events}")
+
+    def test_failed_statement_syncs_heap_before_shrinking_journal(self):
+        events = self._record_sync_order()
+        with self.assertRaises(ValueError):
+            self.engine.execute_sql("UPDATE users SET id = 9 WHERE age = 25")
+        self._assert_heap_synced_before_journal(events)
+
+    def test_explicit_rollback_syncs_heap_before_clearing_journal(self):
+        self.engine.execute_sql("BEGIN")
+        self.engine.execute_sql("DELETE FROM users WHERE id = 2")
+        events = self._record_sync_order()
+        self.engine.execute_sql("ROLLBACK")
+        self._assert_heap_synced_before_journal(events)
 
     def test_committed_data_survives_restart(self):
         self.engine.execute_sql("BEGIN")

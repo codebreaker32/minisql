@@ -117,13 +117,22 @@ class Engine:
 
     def _rollback_to(self, mark: int) -> None:
         """Undo every journaled change after position `mark`, newest first."""
+        touched: dict[str, HeapFile] = {}
         for action, table, rowid in reversed(self._undo_log[mark:]):
             heap = self.get_heap(table)
+            touched[table] = heap
             if action == "insert":
                 heap.delete(rowid)      # tombstone (never reuse the offset: loaded
                                         # indexes may still point at it)
             elif action == "delete":
                 heap.undelete(rowid)    # resurrect
+        # Same ordering rule as _commit_point: the undo writes must be on
+        # disk *before* the journal stops describing how to redo them.
+        # Otherwise a crash between the two leaves a heap that still shows
+        # the rolled-back rows and a journal that says there's nothing to fix.
+        if self.sync:
+            for heap in touched.values():
+                heap.sync()
         del self._undo_log[mark:]
         self._journal.rewrite(self._undo_log)
 
