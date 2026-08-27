@@ -17,6 +17,7 @@ jobs:
   test:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -50,10 +51,12 @@ jobs:
   lint:
     name: Lint (ruff + black)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # The formatters were configured in #6 but the codebase hasn't been
     # formatted yet, so the two lint steps report (as warning annotations)
-    # without failing the job. Once a formatting-only PR lands, delete the
-    # two `continue-on-error` lines below to make lint required.
+    # without failing the job. Tracked in #9: once the formatting-only PR
+    # lands, delete the two `continue-on-error` lines below to make lint
+    # a required check.
     steps:
       - uses: actions/checkout@v4
 
