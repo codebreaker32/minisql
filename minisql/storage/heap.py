@@ -89,6 +89,9 @@ def split_rowid(rowid: int) -> tuple[int, int]:
 class HeapFile:
     def __init__(self, path: str, on_page_write=None, cache_pages: int = 256,
                  page_size: int = PAGE_SIZE):
+        if not 512 <= page_size <= 65535:
+            # slot offsets/lengths and free_upper are u16
+            raise ValueError("page_size must be between 512 and 65535 bytes")
         self.path = path
         self.page_size = page_size
         self._on_page_write = on_page_write
@@ -100,6 +103,7 @@ class HeapFile:
         if new:
             self._write_raw(0, self._file_header())
             self._f.flush()
+            os.fsync(self._f.fileno())   # a table must exist durably before anything journals it
             self._num_pages = 1
         else:
             try:
@@ -119,11 +123,16 @@ class HeapFile:
     def _check_header(self) -> None:
         self._f.seek(0)
         raw = self._f.read(_FILE_HDR.size)
-        if len(raw) < _FILE_HDR.size:
-            raise ValueError(f"{self.path}: not a MiniSQL heap file")
-        magic, version, page_size = _FILE_HDR.unpack(raw)
-        if magic != MAGIC or version != FORMAT_VERSION:
-            raise ValueError(f"{self.path}: unknown heap file format")
+        bad = len(raw) < _FILE_HDR.size
+        if not bad:
+            magic, version, page_size = _FILE_HDR.unpack(raw)
+            bad = magic != MAGIC or version != FORMAT_VERSION or not 512 <= page_size <= 65535
+        if bad:
+            raise ValueError(
+                f"{self.path}: unknown heap file format — this file was probably written by an "
+                f"older MiniSQL (before page-based storage). There is no migration: delete the "
+                f"data directory or re-create the table."
+            )
         self.page_size = page_size
 
     # ---------------- raw page I/O + cache ----------------
@@ -152,20 +161,29 @@ class HeapFile:
         self._cache_put(page_no, image)
         return image
 
-    def _cache_put(self, page_no: int, image: bytearray) -> None:
-        self._cache[page_no] = image
-        self._cache.move_to_end(page_no)
+    def _evict_to_cap(self) -> None:
+        """Drop least-recently-used pages until the cache is within its cap,
+        writing back any that are dirty. Safe on the write path because the
+        engine journals a page's pre-image before it is ever modified."""
         while len(self._cache) > self._cache_cap:
             victim, victim_img = self._cache.popitem(last=False)
             if victim in self._dirty:
                 self._write_raw(victim, bytes(victim_img))
                 self._dirty.discard(victim)
 
+    def _cache_put(self, page_no: int, image: bytearray) -> None:
+        self._cache[page_no] = image
+        self._cache.move_to_end(page_no)
+        self._evict_to_cap()
+
     def _modify(self, page_no: int, image: bytearray) -> None:
-        """Mark a cached page dirty. The pre-image hook must already have run."""
+        """Mark a cached page dirty. The pre-image hook must already have run.
+        The page goes to the most-recently-used end, so it is never the
+        eviction victim of its own insertion."""
         self._cache[page_no] = image
         self._cache.move_to_end(page_no)
         self._dirty.add(page_no)
+        self._evict_to_cap()
 
     def _prepare_modify(self, page_no: int) -> bytearray:
         """Announce a modification of an existing page (journal hook), and
@@ -184,11 +202,13 @@ class HeapFile:
         return page_no
 
     def flush(self) -> None:
-        """Write every dirty page to the file (OS cache)."""
+        """Write every dirty page to the file (OS cache), then trim the cache
+        back to its cap so a commit also releases memory."""
         for page_no in sorted(self._dirty):
             self._write_raw(page_no, bytes(self._cache[page_no]))
         self._dirty.clear()
         self._f.flush()
+        self._evict_to_cap()
 
     def sync(self) -> None:
         """Force everything to stable storage: flush dirty pages, then fsync."""
@@ -212,8 +232,10 @@ class HeapFile:
         self._write_raw(page_no, image)
         self._f.flush()
         if page_no >= self._num_pages:
+            # Only extending the file can change which page is the last data
+            # page; restoring an existing page's image cannot, so don't rescan.
             self._num_pages = page_no + 1
-        self._last_data_page = self._find_last_data_page()
+            self._last_data_page = self._find_last_data_page()
 
     def truncate_pages(self, num_pages: int) -> None:
         """Drop every page >= num_pages (undo of page allocation)."""

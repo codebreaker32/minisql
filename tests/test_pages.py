@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from minisql.engine import Engine
@@ -97,13 +98,55 @@ class HeapPageLayoutTest(unittest.TestCase):
             heap.close()
 
     def test_cache_eviction_writes_dirty_pages(self):
-        heap = HeapFile(os.path.join(TEST_DATA_DIR, "small_cache.tbl"), cache_pages=2)
+        path = os.path.join(TEST_DATA_DIR, "small_cache.tbl")
+        heap = HeapFile(path, cache_pages=2)
+        writes = []
+        real_write = heap._write_raw
+        heap._write_raw = lambda n, img: (writes.append(n), real_write(n, img))
         try:
-            rowids = [heap.insert({"i": i, "pad": "x" * 1000}) for i in range(40)]  # many pages, 2-page cache
-            self.assertEqual([heap.read(r)["i"] for r in rowids], list(range(40)))
+            rowids = [heap.insert({"i": i, "pad": "x" * 1000}) for i in range(40)]  # ~14 pages, 2-page cache
+            self.assertGreater(heap.page_count(), 10)
+            self.assertLessEqual(len(heap._cache), 2)             # the cap is enforced on the write path
+            self.assertGreater(len(writes), 8)                    # evicted dirty pages were written back
+            with open(path, "rb") as f:                            # …and are really on disk, before close()
+                f.seek(PAGE_SIZE)
+                self.assertEqual(f.read(1)[0], PAGE_DATA)
+            self.assertEqual([heap.read(r)["i"] for r in rowids], list(range(40)))   # reads fault pages back in
             self.assertEqual(len(heap), 40)
+            heap.flush()
+            self.assertLessEqual(len(heap._cache), 2)             # flush trims to the cap too
         finally:
             heap.close()
+
+    def test_page_size_must_fit_u16_fields(self):
+        for bad in (65536, 100):
+            with self.assertRaises(ValueError):
+                HeapFile(os.path.join(TEST_DATA_DIR, f"bad{bad}.tbl"), page_size=bad)
+        ok = HeapFile(os.path.join(TEST_DATA_DIR, "ok.tbl"), page_size=1024)
+        try:
+            r = ok.insert({"v": 1})
+            self.assertEqual(ok.read(r), {"v": 1})
+        finally:
+            ok.close()
+
+    def test_old_format_file_gives_a_clear_error(self):
+        path = os.path.join(TEST_DATA_DIR, "old.tbl")
+        with open(path, "wb") as f:
+            f.write(b"L" + (7).to_bytes(4, "big") + b"oldrow!")   # pre-pages byte-append format
+        with self.assertRaisesRegex(ValueError, "older MiniSQL"):
+            HeapFile(path)
+
+    def test_restore_page_does_not_rescan_the_file(self):
+        rowids = [self.heap.insert({"i": i, "pad": "x" * 100}) for i in range(100)]
+        self.heap.flush()
+        image = bytes(self.heap.read_page(1))
+        calls = []
+        real = self.heap._find_last_data_page
+        self.heap._find_last_data_page = lambda: (calls.append(1), real())[1]
+        self.heap.restore_page(1, image)                          # existing page: no rescan
+        self.assertEqual(calls, [])
+        self.heap.restore_page(self.heap.page_count(), image)     # extending the file: rescan needed
+        self.assertEqual(len(calls), 1)
 
     def test_page_write_hook_sees_pre_image_or_none(self):
         events = []
@@ -164,10 +207,21 @@ class PageJournalRecoveryTest(unittest.TestCase):
     def test_failed_statement_inside_transaction_restores_only_its_pages(self):
         self.engine.execute_sql("BEGIN")
         self.engine.execute_sql("INSERT INTO t VALUES (900, 'kept')")
-        with self.assertRaises(ValueError):
-            self.engine.execute_sql("UPDATE t SET id = 1 WHERE id > 100")   # 2nd row duplicates
-        self.assertEqual(self.ids(), list(range(120)) + [900])
+        images_at_rollback = []
+        real = Engine._rollback_statement
+        with unittest.mock.patch.object(Engine, "_rollback_statement",
+                                        lambda eng: (images_at_rollback.append(dict(eng._stmt_images)), real(eng))):
+            with self.assertRaises(ValueError):
+                # 118 -> 5000 succeeds (pages modified), then 119 -> 5000 is a duplicate
+                self.engine.execute_sql("UPDATE t SET id = 5000 WHERE id > 117")
+        self.assertTrue(images_at_rollback and images_at_rollback[0], "statement rollback had pages to restore")
+        self.assertNotIn(("t", "id"), self.engine._indexes)      # index dropped, will rebuild lazily
+        self.assertEqual(self.engine.execute_sql("SELECT id FROM t WHERE id = 5000"), [])
+        self.assertEqual(self.engine.execute_sql("SELECT id FROM t WHERE id = 118"), [{"id": 118}])
+        self.assertEqual(self.ids(), list(range(120)) + [900])   # Dan-equivalent (900) survived
         self.engine.execute_sql("COMMIT")
+        self.engine.close()
+        self.engine = Engine(data_dir=TEST_DATA_DIR)
         self.assertEqual(self.ids(), list(range(120)) + [900])
 
     def test_crash_mid_transaction_recovers_from_pre_images(self):
@@ -194,6 +248,23 @@ class PageJournalRecoveryTest(unittest.TestCase):
             f.write(os.urandom(PAGE_SIZE))
         self.engine = Engine(data_dir=TEST_DATA_DIR)
         self.assertEqual(self.ids(), list(range(120)))
+
+    def test_torn_first_journal_entry_does_not_hide_later_transactions(self):
+        # A crash during the very first append() of a transaction leaves a
+        # torn head entry. It must be cleared on the next start; otherwise the
+        # next transaction's entries land behind it and recovery never sees them.
+        self.engine.close()
+        jpath = os.path.join(TEST_DATA_DIR, "undo.journal")
+        self.assertEqual(os.path.getsize(jpath), 0)
+        with open(jpath, "ab") as f:
+            f.write(b"\x01\x00\x01t\x00\x00\x00")             # torn head, nothing else
+        self.engine = Engine(data_dir=TEST_DATA_DIR)
+        self.assertEqual(os.path.getsize(jpath), 0)                 # cleared at startup
+        self.engine.execute_sql("BEGIN")
+        self.engine.execute_sql("DELETE FROM t WHERE id = 3")
+        self.engine.close()                                         # crash before COMMIT
+        self.engine = Engine(data_dir=TEST_DATA_DIR)
+        self.assertEqual(self.ids(), list(range(120)))              # recovered — row 3 is back
 
     def test_torn_journal_entry_is_ignored(self):
         self.engine.execute_sql("BEGIN")

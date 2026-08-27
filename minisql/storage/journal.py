@@ -24,7 +24,10 @@ Entry format (binary, big-endian):
 The CRC lets recovery ignore a torn final entry: because the engine never
 touches a page until its journal entry is fully written (and fsync'd in
 durable mode), a torn entry can only describe a modification that never
-started.
+started. Parsing stops at the first entry that fails its CRC (SQLite's
+rule too); the engine then clears the journal whenever the file holds any
+bytes at all, so a torn first entry can't linger and hide the entries of a
+later transaction from recovery.
 
 Write-ahead ordering, the whole point: the entry reaches the journal — and
 the disk, in durable mode — *before* the page changes. Clearing the journal
@@ -53,6 +56,11 @@ class UndoJournal:
     def close(self) -> None:
         if not self._f.closed:
             self._f.close()
+
+    def size(self) -> int:
+        """Bytes in the file — non-zero even when no entry parses (torn head)."""
+        self._f.seek(0, os.SEEK_END)
+        return self._f.tell()
 
     @staticmethod
     def _encode(kind: int, table: str, page_no: int, image: bytes | None) -> bytes:

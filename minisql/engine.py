@@ -143,7 +143,7 @@ class Engine:
             if kind == PRE_IMAGE:
                 self.get_heap(table).restore_page(page_no, image)
             else:
-                lowest_new[table] = min(page_no, lowest_new.get(page_no, page_no))
+                lowest_new[table] = min(page_no, lowest_new.get(table, page_no))
         for table, page_no in lowest_new.items():
             self.get_heap(table).truncate_pages(page_no)
         # Restored pages may have freed slots that loaded indexes still
@@ -186,10 +186,13 @@ class Engine:
         mid-statement or mid-transaction. Copy every pre-image back over
         its page and truncate away pages that were new — that also repairs
         a torn (half-written) page, which a rowid-level undo never could."""
-        entries = self._journal.entries()
-        if not entries:
+        if self._journal.size() == 0:
             return
-        self._apply_undo(entries)
+        entries = self._journal.entries()   # [] if only a torn first entry exists
+        if entries:
+            self._apply_undo(entries)
+        # Always reach a commit point: it clears the journal, so a torn entry
+        # can't stay at the head and hide the next transaction's pre-images.
         self._commit_point()
 
     # ---------------- constraints ----------------
