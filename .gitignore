@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 bench_data/
 tests/_tmp_*/
+data/
+demo_data/
