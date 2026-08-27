@@ -7,13 +7,19 @@ Wires everything together:
 Responsibilities that live here rather than in the planner/executor:
   - constraint enforcement on writes: column existence, column types (with
     the usual int -> REAL widening), PRIMARY KEY uniqueness and NOT NULL;
-  - the write path (`_do_insert` / `_do_delete`), which journals every heap
-    mutation before performing it;
+  - the write path (`_do_insert` / `_do_delete`) and the page-journaling
+    hook the heap calls before it modifies any page: the page's pre-image
+    goes to the on-disk rollback journal (once per transaction) and to an
+    in-memory statement journal (once per statement) — SQLite's design;
   - transactions: BEGIN / COMMIT / ROLLBACK, plus statement-level atomicity
     (a statement that fails halfway — e.g. an UPDATE that would create a
     duplicate key on its third row — is undone completely before the error
     is raised, like a real engine);
-  - crash recovery on startup, from the same undo journal.
+  - crash recovery on startup, from the same rollback journal.
+
+Rollback (of a statement or a transaction) restores page images, which can
+free slots that loaded B-tree indexes still point at; those indexes are
+therefore dropped and rebuilt lazily from the heap on next use.
 
 Indexes are kept in memory (BTree objects) and rebuilt by scanning the heap
 file the first time a table/column's index is needed after a fresh process
@@ -32,7 +38,7 @@ from .ast_nodes import (
 from .catalog import Catalog, TableSchema
 from .storage.heap import HeapFile
 from .storage.btree import BTree
-from .storage.journal import UndoJournal
+from .storage.journal import UndoJournal, PRE_IMAGE, NEW_PAGE
 from .planner import (
     build_plan, explain as explain_plan, validate_where,
     _split_conjuncts, pick_index_conjunct, _and_together,
@@ -42,20 +48,26 @@ from .executor import execute, index_lookup, _eval, _qualify
 
 class Engine:
     def __init__(self, data_dir: str = "data", sync: bool = True):
-        """`sync=True` fsyncs the journal before every heap write and the heap
-        files at every commit point, so committed data survives power loss.
-        `sync=False` still journals (so a process crash is recoverable) but
-        leaves flushing to the OS — the same knob as SQLite's
-        PRAGMA synchronous=OFF, used by the benchmark for bulk loading."""
+        """`sync=True` fsyncs the journal before every page modification and
+        the heap files at every commit point, so committed data survives
+        power loss. `sync=False` still journals (so a process crash is
+        recoverable) but leaves flushing to the OS — the same knob as
+        SQLite's PRAGMA synchronous=OFF, used by the benchmark for bulk
+        loading."""
         self.catalog = Catalog(data_dir)
         self.sync = sync
         self._heaps: dict[str, HeapFile] = {}
         self._indexes: dict[tuple[str, str], BTree] = {}
         self._in_transaction = False
-        # In-memory mirror of the on-disk undo journal for the current
-        # transaction (or current autocommit statement): a list of
-        # ("insert", table, rowid) / ("delete", table, rowid).
-        self._undo_log: list[tuple[str, str, int]] = []
+        # Transaction-level rollback journal (on disk, mirrored in memory):
+        # one entry per page first touched in the transaction —
+        # (kind, table, page_no, pre-image or None for a new page).
+        self._txn_entries: list[tuple[int, str, int, bytes | None]] = []
+        self._txn_saved: set[tuple[str, int]] = set()
+        # Statement-level journal (memory only): pre-image of every page
+        # first touched by the *current statement*, used to undo just that
+        # statement on failure without disturbing the rest of the transaction.
+        self._stmt_images: dict[tuple[str, int], bytes | None] = {}
         self._journal = UndoJournal(self.catalog.journal_path(), sync=sync)
         self._recover()
 
@@ -68,7 +80,10 @@ class Engine:
 
     def get_heap(self, table: str) -> HeapFile:
         if table not in self._heaps:
-            self._heaps[table] = HeapFile(self.catalog.heap_path(table))
+            self._heaps[table] = HeapFile(
+                self.catalog.heap_path(table),
+                on_page_write=lambda page_no, old, t=table: self._before_page_write(t, page_no, old),
+            )
         return self._heaps[table]
 
     def get_index(self, table: str, column: str) -> BTree:
@@ -88,80 +103,96 @@ class Engine:
             if key in self._indexes:  # only touch already-loaded indexes
                 self._indexes[key].insert(row.get(col), rowid)
 
-    # ---------------- write path + undo journal ----------------
+    # ---------------- write path + rollback journal ----------------
 
-    def _log(self, action: str, table: str, rowid: int) -> None:
-        # Write-ahead: the undo record is on disk before the heap changes.
-        self._journal.append(action, table, rowid)
-        self._undo_log.append((action, table, rowid))
+    def _before_page_write(self, table: str, page_no: int, old_image: bytes | None) -> None:
+        """Called by a HeapFile just before it modifies a page (old_image is
+        the page's current bytes) or allocates one (old_image is None).
+        Write-ahead: the pre-image is on disk before the page changes."""
+        key = (table, page_no)
+        if key not in self._stmt_images:
+            self._stmt_images[key] = old_image
+        if key not in self._txn_saved:
+            kind = NEW_PAGE if old_image is None else PRE_IMAGE
+            self._journal.append(kind, table, page_no, old_image)
+            self._txn_entries.append((kind, table, page_no, old_image))
+            self._txn_saved.add(key)
 
     def _do_insert(self, table: str, heap: HeapFile, row: dict) -> int:
-        """Insert a row, journaling how to undo it first. Every INSERT and
-        every UPDATE's "insert the new version" step goes through here."""
-        rowid = heap.next_rowid()
-        self._log("insert", table, rowid)
-        actual = heap.insert(row)
-        assert actual == rowid
+        """Insert a row (the heap journals the pages it touches) and update
+        every loaded index. Every INSERT and every UPDATE's "insert the new
+        version" step goes through here."""
+        rowid = heap.insert(row)
         self._update_indexes_on_insert(table, row, rowid)
         return rowid
 
     def _do_delete(self, table: str, heap: HeapFile, rowid: int) -> None:
-        """Tombstone a row, journaling how to undo it first.
-        We deliberately do NOT remove the row's entry from any loaded B-tree
-        index (this BTree has no delete operation — see README). That's what
-        makes rollback's index story simple: since the index was never
-        touched, resurrecting a row via undelete() makes it immediately
-        findable via the index again, with zero extra code."""
-        self._log("delete", table, rowid)
+        """Tombstone a row. The B-tree entry is deliberately left in place
+        (this BTree has no delete operation): every index read path filters
+        rowids whose heap.read() is None, so a stale entry is harmless."""
         heap.delete(rowid)
 
-    def _rollback_to(self, mark: int) -> None:
-        """Undo every journaled change after position `mark`, newest first."""
-        touched: dict[str, HeapFile] = {}
-        for action, table, rowid in reversed(self._undo_log[mark:]):
-            heap = self.get_heap(table)
-            touched[table] = heap
-            if action == "insert":
-                heap.delete(rowid)      # tombstone (never reuse the offset: loaded
-                                        # indexes may still point at it)
-            elif action == "delete":
-                heap.undelete(rowid)    # resurrect
-        # Same ordering rule as _commit_point: the undo writes must be on
-        # disk *before* the journal stops describing how to redo them.
-        # Otherwise a crash between the two leaves a heap that still shows
-        # the rolled-back rows and a journal that says there's nothing to fix.
-        if self.sync:
-            for heap in touched.values():
-                heap.sync()
-        del self._undo_log[mark:]
-        self._journal.rewrite(self._undo_log)
+    def _apply_undo(self, entries) -> set[str]:
+        """Put pages back: pre-images are restored, new pages truncated
+        away. Newest first, so a page journaled several times ends at its
+        oldest image. Returns the tables touched."""
+        touched: set[str] = set()
+        lowest_new: dict[str, int] = {}
+        for kind, table, page_no, image in reversed(entries):
+            touched.add(table)
+            if kind == PRE_IMAGE:
+                self.get_heap(table).restore_page(page_no, image)
+            else:
+                lowest_new[table] = min(page_no, lowest_new.get(table, page_no))
+        for table, page_no in lowest_new.items():
+            self.get_heap(table).truncate_pages(page_no)
+        # Restored pages may have freed slots that loaded indexes still
+        # point at; those rowids could be reused, so drop the indexes and
+        # let them rebuild lazily from the (now correct) heap.
+        self._indexes = {k: v for k, v in self._indexes.items() if k[0] not in touched}
+        return touched
+
+    def _rollback_statement(self) -> None:
+        """Undo only the current statement, from the in-memory statement
+        journal. The transaction journal keeps its entries: they are still
+        valid pre-images for a later full ROLLBACK or crash recovery."""
+        entries = [(PRE_IMAGE if img is not None else NEW_PAGE, t, p, img)
+                   for (t, p), img in self._stmt_images.items()]
+        self._apply_undo(entries)
+        self._stmt_images = {}
+
+    def _rollback_transaction(self) -> None:
+        self._apply_undo(self._txn_entries)
+        self._stmt_images = {}
+        self._commit_point()          # the rollback itself is now durable
 
     def _commit_point(self) -> None:
-        """Make everything journaled so far permanent: heap files to disk
-        first, then discard the journal. (The other order could lose a
-        committed write with nothing left to recover from.)"""
-        if self.sync:
-            for heap in self._heaps.values():
+        """Make everything journaled so far permanent: dirty pages to the
+        heap files (and to disk, in durable mode) *first*, then discard the
+        journal. The other order could lose a committed write with nothing
+        left to recover from."""
+        for heap in self._heaps.values():
+            if self.sync:
                 heap.sync()
-        self._undo_log = []
+            else:
+                heap.flush()
         self._journal.clear()
+        self._txn_entries = []
+        self._txn_saved = set()
+        self._stmt_images = {}
 
     def _recover(self) -> None:
-        """Startup: if the journal is non-empty, the previous process died
-        mid-statement or mid-transaction. Undo its heap changes in reverse.
-        An interrupted insert is undone by truncating the heap back to that
-        offset — journaled inserts are always the tail of the file, since
-        the journal is cleared at every commit point — which also discards a
-        torn, half-written record."""
-        entries = self._journal.entries()
-        if not entries:
+        """Startup: a non-empty journal means the previous process died
+        mid-statement or mid-transaction. Copy every pre-image back over
+        its page and truncate away pages that were new — that also repairs
+        a torn (half-written) page, which a rowid-level undo never could."""
+        if self._journal.size() == 0:
             return
-        for action, table, rowid in reversed(entries):
-            heap = self.get_heap(table)
-            if action == "insert":
-                heap.truncate(rowid)
-            elif action == "delete":
-                heap.undelete(rowid)
+        entries = self._journal.entries()   # [] if only a torn first entry exists
+        if entries:
+            self._apply_undo(entries)
+        # Always reach a commit point: it clears the journal, so a torn entry
+        # can't stay at the head and hide the next transaction's pre-images.
         self._commit_point()
 
     # ---------------- constraints ----------------
@@ -294,8 +325,7 @@ class Engine:
             if stmt.kind == "ROLLBACK":
                 if not self._in_transaction:
                     raise ValueError("No transaction is in progress")
-                self._rollback_to(0)
-                self._commit_point()      # the rollback itself is now durable
+                self._rollback_transaction()
                 self._in_transaction = False
                 return None
 
@@ -308,14 +338,16 @@ class Engine:
             return list(execute(plan, self))
 
         if isinstance(stmt, (InsertStmt, UpdateStmt, DeleteStmt)):
-            # Statement-level atomicity: if anything below raises, undo just
-            # this statement's journaled changes (leaving an enclosing
+            # Statement-level atomicity: if anything below raises, put back
+            # the pages this statement touched (leaving an enclosing
             # transaction's earlier work intact) and re-raise.
-            mark = len(self._undo_log)
+            self._stmt_images = {}
             try:
                 result = self._execute_dml(stmt)
             except Exception:
-                self._rollback_to(mark)
+                self._rollback_statement()
+                if not self._in_transaction:
+                    self._commit_point()  # autocommit: the no-op is now durable
                 raise
             if not self._in_transaction:
                 self._commit_point()      # autocommit
