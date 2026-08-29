@@ -89,9 +89,9 @@ def split_rowid(rowid: int) -> tuple[int, int]:
 class HeapFile:
     def __init__(self, path: str, on_page_write=None, cache_pages: int = 256,
                  page_size: int = PAGE_SIZE):
-        if not 512 <= page_size <= 65535:
+        if not isinstance(page_size, int) or not 512 <= page_size <= 65535:
             # slot offsets/lengths and free_upper are u16
-            raise ValueError("page_size must be between 512 and 65535 bytes")
+            raise ValueError("page_size must be an int between 512 and 65535 bytes")
         self.path = path
         self.page_size = page_size
         self._on_page_write = on_page_write
@@ -202,13 +202,12 @@ class HeapFile:
         return page_no
 
     def flush(self) -> None:
-        """Write every dirty page to the file (OS cache), then trim the cache
-        back to its cap so a commit also releases memory."""
+        """Write every dirty page to the file (OS cache). The cache is already
+        within its cap — eviction runs on every insertion into it."""
         for page_no in sorted(self._dirty):
             self._write_raw(page_no, bytes(self._cache[page_no]))
         self._dirty.clear()
         self._f.flush()
-        self._evict_to_cap()
 
     def sync(self) -> None:
         """Force everything to stable storage: flush dirty pages, then fsync."""
@@ -232,10 +231,14 @@ class HeapFile:
         self._write_raw(page_no, image)
         self._f.flush()
         if page_no >= self._num_pages:
-            # Only extending the file can change which page is the last data
-            # page; restoring an existing page's image cannot, so don't rescan.
             self._num_pages = page_no + 1
-            self._last_data_page = self._find_last_data_page()
+        # No rescan (that made rollback O(pages x trailing overflow pages)).
+        # But the on-disk copy of this page may have been torn when the file
+        # was opened — its type byte unreadable, so the startup scan skipped
+        # it — and the restored image is the truth: if it is a data page
+        # beyond the one we know about, it is the last data page.
+        if image[0] == PAGE_DATA and (self._last_data_page is None or page_no > self._last_data_page):
+            self._last_data_page = page_no
 
     def truncate_pages(self, num_pages: int) -> None:
         """Drop every page >= num_pages (undo of page allocation)."""

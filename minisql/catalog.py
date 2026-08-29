@@ -52,9 +52,16 @@ class Catalog:
                 self.tables[name] = TableSchema(**t)
 
     def _save(self):
+        # Write-to-temp + fsync + atomic rename: a crash mid-write leaves
+        # either the old catalog or the new one, never a torn file — the
+        # catalog is the one file that makes every table reachable.
         raw = {name: asdict(schema) for name, schema in self.tables.items()}
-        with open(self.path, "w") as f:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(raw, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
 
     def create_table(self, name: str, columns: list[dict]) -> None:
         if name in self.tables:
